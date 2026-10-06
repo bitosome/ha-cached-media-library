@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.2
+
+- Add `/status?lookup=<id>` (or `movie:<id>`) reporting why one title is or is not
+  published: its shelf ranks, metadata state and per-status episode checks.
+
 ## 0.6.1
 
 - Re-crawl once when the rank column is introduced, so existing shelves get ranks

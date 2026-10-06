@@ -290,6 +290,25 @@ class Store:
                 meta['videos'] = [v for v in meta.get('videos', []) if v.get('id') in allowed and aired(v, now)]
             return meta
 
+    def lookup(self, kind, ident):
+        """Diagnostics for one title: why it is or is not published."""
+        with self.lock:
+            title = self.db.execute('SELECT type,id,priority,rank,meta_checked,meta_due,meta_claimed FROM titles WHERE type=? AND id=?',
+                                    (kind, ident)).fetchone()
+            if title is None:
+                return {'known': False}
+            memberships = self.db.execute('SELECT category,rank FROM membership WHERE type=? AND id=? ORDER BY rank',
+                                          (kind, ident)).fetchall()
+            checks = self.db.execute('SELECT status,count(*),min(due),max(expires) FROM checks WHERE type=? AND parent=? GROUP BY status',
+                                     (kind, ident)).fetchall()
+            episodes = self.db.execute('SELECT count(*) FROM checks WHERE type=? AND parent=?', (kind, ident)).fetchone()[0]
+            return {'known': True, 'type': title['type'], 'id': title['id'], 'priority': title['priority'],
+                    'rank': title['rank'], 'meta_checked': title['meta_checked'], 'meta_due': title['meta_due'],
+                    'meta_claimed': title['meta_claimed'], 'episode_checks': episodes,
+                    'memberships': [{'category': m['category'], 'rank': m['rank']} for m in memberships],
+                    'checks': [{'status': c[0], 'count': c[1], 'earliest_due': c[2], 'latest_expiry': c[3]} for c in checks],
+                    'visible': self.visible(kind, ident, time.time())}
+
     def exposed_categories(self):
         """Catalogues worth publishing: still crawling, or proven to contain titles.
         A catalogue that finished with nothing is dropped, so a stale or helper
@@ -562,7 +581,7 @@ class App:
         for kind in ('movie', 'series'):
             catalogs.append({'id': 'cached-search', 'type': kind, 'name': 'Available ' + kind + ' search',
                              'extra': [{'name': 'search', 'isRequired': True}, {'name': 'skip', 'isRequired': False}]})
-        return {'id': 'local.cached.media.library', 'version': '0.6.1', 'name': 'Cached Media Library',
+        return {'id': 'local.cached.media.library', 'version': '0.6.2', 'name': 'Cached Media Library',
                 'description': 'Recently verified cached streams matching your AIOStreams filters. Metadata only.',
                 'types': ['movie', 'series'],
                 'resources': ['catalog', {'name': 'meta', 'types': ['movie', 'series'], 'idPrefixes': ['tt', 'tmdb:']}],
@@ -593,7 +612,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         app = self.server.app
-        path = urlsplit(self.path).path
+        split = urlsplit(self.path)
+        path = split.path
+        if path in ('/', '/health', '/status') and parse_qs(split.query).get('lookup'):
+            ident = parse_qs(split.query)['lookup'][0]
+            kind = 'series'
+            if ':' in ident and ident.split(':', 1)[0] in ('movie', 'series'):
+                kind, ident = ident.split(':', 1)
+            found = app.store.lookup(kind, ident)
+            if not found.get('known') and kind == 'series':
+                found = app.store.lookup('movie', ident)
+            self.send({'lookup': found})
+            return
         if path in ('/', '/health', '/status'):
             status = {'ready': app.ready, 'issue': app.error, 'last_policy_sync': app.store.setting('last_sync'),
                       'worker_ages': {k: round(time.time() - v) for k, v in app.heartbeats.items()}, **app.store.status()}
