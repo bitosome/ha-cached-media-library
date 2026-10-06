@@ -5,7 +5,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from server import Store, aired, episode_order, is_scanner_catalog, policy_fingerprint, stream_verdict
+from server import App, Store, aired, episode_order, is_scanner_catalog, policy_fingerprint, stream_verdict
 
 import time
 
@@ -108,6 +108,63 @@ class IndexTests(unittest.TestCase):
         self.assertTrue(is_scanner_catalog('cachedlibrary1a2b.cached-abc', 'cachedlibrary'))
         self.assertTrue(is_scanner_catalog('other.cached-search', 'cachedlibrary'))
         self.assertFalse(is_scanner_catalog('familylivee3b0.tmdb-1', 'cachedlibrary'))
+
+    def test_empty_catalogues_are_not_published(self):
+        # A catalogue that finished crawling with nothing leaves no empty shelf.
+        self.s.add_page(self.cat, [], 0, 1000)
+        self.assertEqual(self.s.exposed_categories(), [])
+        self.add(1)
+        self.assertTrue(self.s.exposed_categories())
+
+    def test_switchover_keeps_catalogue_metadata(self):
+        # Learned categories stay published even when the family manifest no longer
+        # lists them, which is what makes a restart after switch-over safe.
+        self.add(2)
+        self.s.add_categories([], 'cachedlibrary')
+        self.assertEqual([c['name'] for c in self.s.exposed_categories()], ['Movies'])
+
+
+class ConfigurationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def app(self, **overrides):
+        options = {'aiostreams_url': 'http://aiostreams:3000', 'active_uuid': 'u', 'active_password': 'p',
+                   'stremio_uuid': 'u', 'stremio_encrypted_password': 'e', 'endpoint_token': ''}
+        options.update(overrides)
+        return App(options, self.tmp.name + '/db-' + str(abs(hash(str(overrides)))))
+
+    def test_upstream_catalogue_filtering(self):
+        app = self.app()
+        self.assertTrue(app.is_upstream({'id': 'familylivee3b0.tmdb-x', 'type': 'movie'}))
+        self.assertFalse(app.is_upstream({'id': 'cachedlibrary1a2b.cached-ab', 'type': 'movie'}))
+        self.assertFalse(app.is_upstream({'id': 'jfmetae3b0.tmdb.search', 'type': 'movie',
+                                          'extra': [{'name': 'search', 'isRequired': True}]}))
+        self.assertFalse(app.is_upstream({'id': 'x', 'type': 'anime'}))
+
+    def test_missing_token_is_generated_and_persisted(self):
+        app = self.app()
+        self.assertGreaterEqual(len(app.o['endpoint_token']), 24)
+        again = App({'aiostreams_url': 'http://aiostreams:3000', 'active_uuid': 'u', 'active_password': 'p',
+                     'stremio_uuid': 'u', 'stremio_encrypted_password': 'e', 'endpoint_token': ''},
+                    self.tmp.name + '/db-' + str(abs(hash('{}'))))
+        self.assertEqual(app.o['endpoint_token'], again.o['endpoint_token'])
+
+    def test_configuration_problems_are_reported_not_raised(self):
+        app = self.app(aiostreams_url='', active_uuid='', active_password='',
+                       stremio_uuid='', stremio_encrypted_password='', endpoint_token='short')
+        problems = app.config_problems()
+        self.assertEqual(len(problems), 4)
+
+    def test_catalog_source_defaults_to_the_active_profile(self):
+        app = self.app()
+        self.assertEqual(app.catalog_source, app.source)
+        other = self.app(catalog_uuid='c', catalog_encrypted_password='k')
+        self.assertNotEqual(other.catalog_source, other.source)
+        self.assertTrue(other.catalog_source.endswith('/stremio/c/k'))
 
 
 if __name__ == '__main__':

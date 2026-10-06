@@ -12,6 +12,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -256,6 +257,15 @@ class Store:
                 meta['videos'] = [v for v in meta.get('videos', []) if v.get('id') in allowed and aired(v, now)]
             return meta
 
+    def exposed_categories(self):
+        """Catalogues worth publishing: still crawling, or proven to contain titles.
+        A catalogue that finished with nothing is dropped, so a stale or helper
+        entry cannot leave a permanently empty shelf."""
+        with self.lock:
+            return self.db.execute('''SELECT c.* FROM categories c
+              WHERE c.done=0 OR EXISTS(SELECT 1 FROM membership m WHERE m.category=c.id)
+              ORDER BY c.position''').fetchall()
+
     def status(self):
         now = time.time()
         with self.lock:
@@ -288,20 +298,69 @@ class App:
         self.stop = threading.Event()
         self.heartbeats = {}
         self.instance_id = options.get('scanner_instance_id', 'cachedlibrary')
-        self.base = options['aiostreams_url'].rstrip('/')
-        self.source = self.base + '/stremio/' + quote(options['stremio_uuid'], safe='') + '/' + quote(options['stremio_encrypted_password'], safe='')
-        if len(options['endpoint_token']) < 24:
-            raise ValueError('Endpoint token must be at least 24 characters')
+        self.base = (options.get('aiostreams_url') or '').rstrip('/')
+        self.source = self.stremio(options.get('stremio_uuid'), options.get('stremio_encrypted_password'))
+        # Catalogue definitions come from a profile that is never switched over, so a
+        # fresh install can still bootstrap after the family catalogues are hidden.
+        self.catalog_source = self.stremio(
+            options.get('catalog_uuid') or options.get('stremio_uuid'),
+            options.get('catalog_encrypted_password') or options.get('stremio_encrypted_password'))
+        self.o['endpoint_token'] = self.resolve_token(options.get('endpoint_token'))
+        if self.catalog_source is None:
+            self.catalog_source = self.source
 
-    def request(self, path, config=False):
-        """Read-only. `config=True` reads the profile settings over the dashboard API."""
+    def stremio(self, uuid, encrypted):
+        if not uuid or not encrypted:
+            return None
+        return self.base + '/stremio/' + quote(uuid, safe='') + '/' + quote(encrypted, safe='')
+
+    def resolve_token(self, token):
+        """Use the configured token, otherwise generate one and remember it, so a
+        fresh install can start without hand-crafted secrets."""
+        token = (token or '').strip()
+        if token:
+            return token
+        token = self.store.setting('endpoint_token') or secrets.token_urlsafe(32)
+        self.store.setting('endpoint_token', token)
+        return token
+
+    def config_problems(self):
+        problems = []
+        if not self.base.startswith(('http://', 'https://')):
+            problems.append('aiostreams_url must be an http(s) URL')
+        if not self.o.get('active_uuid') or not self.o.get('active_password'):
+            problems.append('active_uuid and active_password are required')
+        if not self.o.get('stremio_uuid') or not self.o.get('stremio_encrypted_password'):
+            problems.append('stremio_uuid and stremio_encrypted_password are required')
+        if len(self.o['endpoint_token']) < 24:
+            problems.append('endpoint_token must be at least 24 characters when set')
+        return problems
+
+    def is_upstream(self, catalog):
+        """A browsable upstream catalogue, as opposed to one of our own or a search helper."""
+        cid = catalog.get('id')
+        if not cid or catalog.get('type') not in ('movie', 'series'):
+            return False
+        if is_scanner_catalog(cid, self.instance_id):
+            return False
+        return not any(e.get('name') == 'search' and e.get('isRequired') for e in catalog.get('extra', []))
+
+    def upstream_catalogs(self):
+        catalogs = [c for c in self.request('/manifest.json', catalog=True).get('catalogs', []) if self.is_upstream(c)]
+        if not catalogs and self.catalog_source != self.source:
+            catalogs = [c for c in self.request('/manifest.json').get('catalogs', []) if self.is_upstream(c)]
+        return catalogs
+
+    def request(self, path, config=False, catalog=False):
+        """Read-only. `config=True` reads profile settings over the dashboard API,
+        `catalog=True` reads from the catalogue source profile."""
         headers = {'User-Agent': 'CachedMediaLibrary/0.1', 'Content-Type': 'application/json'}
         if config:
             raw = self.o['active_uuid'] + ':' + self.o['active_password']
             headers['Authorization'] = 'Basic ' + base64.b64encode(raw.encode()).decode()
             url = self.base + path
         else:
-            url = self.source + path
+            url = (self.catalog_source if catalog else self.source) + path
         with urlopen(Request(url, headers=headers), timeout=65) as response:
             return json.load(response)
 
@@ -313,16 +372,22 @@ class App:
         return None
 
     def synchronize(self):
+        problems = self.config_problems()
+        if problems:
+            raise ValueError('; '.join(problems))
         config = self.request('/api/v1/user', config=True)['data']['userData']
         problem = self.check_policy(config)
         if problem:
             raise ValueError(problem)
+        catalogs = self.upstream_catalogs()
+        if not catalogs:
+            raise ValueError('no upstream catalogues found in the profile manifest')
         fingerprint = policy_fingerprint(config)
         with self.policy_lock:
             changed = self.store.setting('policy') != fingerprint
             if changed:
                 self.ready = False
-            self.store.add_categories(self.request('/manifest.json').get('catalogs', []), self.instance_id)
+            self.store.add_categories(catalogs, self.instance_id)
             if changed:
                 self.store.invalidate()
                 self.store.setting('policy', fingerprint)
@@ -357,7 +422,7 @@ class App:
                 path = '/catalog/' + cat['type'] + '/' + quote(cat['upstream'], safe='')
                 path += ('/skip=' + str(offset) if offset else '') + '.json'
                 try:
-                    result = self.request(path)
+                    result = self.request(path, catalog=True)
                     if not isinstance(result.get('metas'), list):
                         raise ValueError('Invalid catalog response')
                     self.store.add_page(cat, result['metas'], offset, self.o.get('max_candidates_per_category', 1000))
@@ -438,13 +503,12 @@ class App:
 
     def manifest(self):
         catalogs = []
-        with self.store.lock:
-            for cat in self.store.db.execute('SELECT * FROM categories ORDER BY position').fetchall():
-                catalogs.append({'id': cat['id'], 'type': cat['type'], 'name': cat['name'], 'extra': [{'name': 'skip', 'isRequired': False}]})
+        for cat in self.store.exposed_categories():
+            catalogs.append({'id': cat['id'], 'type': cat['type'], 'name': cat['name'], 'extra': [{'name': 'skip', 'isRequired': False}]})
         for kind in ('movie', 'series'):
             catalogs.append({'id': 'cached-search', 'type': kind, 'name': 'Available ' + kind + ' search',
                              'extra': [{'name': 'search', 'isRequired': True}, {'name': 'skip', 'isRequired': False}]})
-        return {'id': 'local.cached.media.library', 'version': '0.2.4', 'name': 'Cached Media Library',
+        return {'id': 'local.cached.media.library', 'version': '0.3.0', 'name': 'Cached Media Library',
                 'description': 'Recently verified cached streams matching your AIOStreams filters. Metadata only.',
                 'types': ['movie', 'series'],
                 'resources': ['catalog', {'name': 'meta', 'types': ['movie', 'series'], 'idPrefixes': ['tt', 'tmdb:']}],
@@ -518,9 +582,15 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == '__main__':
     with open(os.environ.get('OPTIONS_PATH', '/data/options.json')) as f:
         options = json.load(f)
-    app = App(options, os.environ.get('DATABASE_PATH', '/data/availability.sqlite'))
+    try:
+        app = App(options, os.environ.get('DATABASE_PATH', '/data/availability.sqlite'))
+    except Exception as exc:  # Never dump a traceback for a configuration problem.
+        print('Cached Media Library cannot start: ' + type(exc).__name__ + ': ' + str(exc), flush=True)
+        raise SystemExit(1)
     app.start()
     server = ThreadingHTTPServer(('0.0.0.0', 8097), Handler)
     server.app = app
     print('Cached Media Library listening; metadata only', flush=True)
+    print('Add this manifest URL to AIOStreams as a custom add-on:', flush=True)
+    print('  http://HOME_ASSISTANT_HOST:8097/' + app.o['endpoint_token'] + '/manifest.json', flush=True)
     server.serve_forever()

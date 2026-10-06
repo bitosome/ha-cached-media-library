@@ -28,9 +28,10 @@ URLs, and never proxies video.
 
 1. Every few minutes it re-reads the profile. A change to any filter-relevant
    setting invalidates stored verdicts.
-2. It learns the browsable catalogues from your profile's manifest, skipping any
-   catalogue it publishes itself. Learned catalogues are never dropped, so
-   indexing continues after the upstream catalogues are hidden.
+2. It learns the browsable catalogues from a profile's manifest, skipping any
+   catalogue it publishes itself. Point `catalog_uuid`/`catalog_encrypted_password`
+   at a profile that keeps the upstream catalogues enabled and is never switched
+   over, so a fresh install can still bootstrap after switch-over.
 3. Each candidate is checked through your own `/stream` endpoint, so cache,
    quality and language rules are identical to playback.
 4. A movie is published once it has a playable HTTP stream. A series is published

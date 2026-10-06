@@ -20,11 +20,20 @@ configuration:
     name: Stremio encrypted password
     description: >-
       The profile's encrypted password, the last segment of its Stremio URL.
+  catalog_uuid:
+    name: Catalogue source UUID (optional)
+    description: >-
+      UUID of the profile whose catalogues are indexed. Use a profile that keeps
+      the upstream catalogues enabled and is never switched over. Defaults to the
+      Stremio endpoint UUID.
+  catalog_encrypted_password:
+    name: Catalogue source encrypted password (optional)
+    description: Encrypted password of that profile.
   endpoint_token:
     name: Endpoint token
     description: >-
-      Private token protecting this app's Stremio endpoint. At least 24
-      characters. Treat it as a password.
+      Private token protecting this app's Stremio endpoint. Leave empty to generate
+      and remember one; the manifest URL is printed in the app log at startup.
   positive_hours:
     name: Positive result lifetime (hours)
     description: How long a confirmed cached stream stays published.

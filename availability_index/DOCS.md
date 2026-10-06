@@ -15,7 +15,9 @@ AIOStreams configuration.
 | `active_password` | Password of that profile. |
 | `stremio_uuid` | UUID used in the profile's Stremio endpoint. Usually the same as `active_uuid`. |
 | `stremio_encrypted_password` | The profile's encrypted password, the last segment of its Stremio URL. |
-| `endpoint_token` | Private token protecting this app's Stremio endpoint. At least 24 characters. |
+| `catalog_uuid` | Optional. UUID of the profile whose catalogues are indexed. Defaults to `stremio_uuid`. |
+| `catalog_encrypted_password` | Optional. Encrypted password of that profile. |
+| `endpoint_token` | Private token protecting this app's Stremio endpoint. Generated and remembered when left empty. |
 | `positive_hours` | How long a confirmed cached stream stays published (1–48). |
 | `negative_hours` | How long a negative result is trusted before rechecking (1–168). |
 | `max_candidates_per_category` | How deep each catalogue is indexed (20–5000). |
@@ -51,8 +53,21 @@ in the app is one-way.
 ## Why disabling upstream catalogues does not stop indexing
 
 AIOStreams hides disabled catalogues from clients and from client search, but its
-Stremio endpoint still serves them by id. The app already remembers the catalogue
-list, so it keeps verifying new additions after the switch-over.
+Stremio endpoint still serves them by id. The app also remembers the catalogue list
+in its database, so it keeps verifying new additions after the switch-over.
+
+### Reinstalling or starting fresh
+
+The app needs to learn which catalogues to index. After switch-over the family
+catalogue list is served by this app itself, so the family manifest no longer
+contains the upstream definitions. To stay reinstall-proof, point
+`catalog_uuid`/`catalog_encrypted_password` at a profile that still has the upstream
+catalogues enabled and is never switched over. A fresh install then bootstraps from
+that profile instead of depending on data it no longer has. If those options are
+empty the app falls back to the active profile's own manifest.
+
+A catalogue that finishes crawling with no titles at all is not published, so a
+stale definition cannot leave a permanently empty shelf.
 
 ## Operating notes
 
@@ -84,6 +99,18 @@ Both are unauthenticated and deliberately expose no credentials, URLs or tokens.
 `AIOStreams is not requiring a cached TorBox stream`.** The mirrored profile no
 longer enforces cached-only playback. Fix the profile; the app resumes publishing
 automatically.
+
+**`ready` is false with `aiostreams_url must be an http(s) URL`, `active_uuid and
+active_password are required`, `stremio_uuid and stremio_encrypted_password are
+required`, or `endpoint_token must be at least 24 characters when set`.** The app is
+running but not indexed because its options are incomplete. Open the app
+configuration, fill in the reported values, and restart. Nothing is lost: the app
+reports the problem instead of crash-looping, and `/status` repeats it.
+
+**`ready` is false with `no upstream catalogues found in the profile manifest`.**
+The catalogue source profile has no browsable catalogues. Check
+`catalog_uuid`/`catalog_encrypted_password`, or re-enable at least one catalogue in
+the profile the app reads.
 
 **`Synchronisation failed (HTTPError ...)`.** Check `aiostreams_url`, the profile
 UUID/password pair and the Stremio credentials. A `404` usually means a wrong

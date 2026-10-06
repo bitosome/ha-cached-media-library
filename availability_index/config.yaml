@@ -1,5 +1,5 @@
 name: Cached Media Library
-version: "0.2.4"
+version: "0.3.0"
 slug: availability_index
 description: Verified cached discovery and search for AIOStreams; read-only, never proxies video
 arch: [amd64, aarch64]
@@ -18,6 +18,8 @@ options:
   active_password: ""
   stremio_uuid: ""
   stremio_encrypted_password: ""
+  catalog_uuid: ""
+  catalog_encrypted_password: ""
   endpoint_token: ""
   positive_hours: 12
   negative_hours: 24
@@ -31,6 +33,8 @@ schema:
   active_password: password
   stremio_uuid: str
   stremio_encrypted_password: password
+  catalog_uuid: str?
+  catalog_encrypted_password: password?
   endpoint_token: password
   positive_hours: int(1,48)
   negative_hours: int(1,168)

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0
+
+- Fix a bootstrap deadlock: after switch-over the family manifest contains only this
+  app's own catalogues, so a fresh install learned nothing and published no shelves.
+  Catalogue definitions can now come from a separate, never switched-over profile
+  (`catalog_uuid`/`catalog_encrypted_password`); a catalogue that finishes crawling
+  empty is no longer published.
+- Generate and remember `endpoint_token` when it is left empty, and print the
+  manifest URL at startup, so a fresh install no longer crash-loops.
+- Report incomplete configuration through `/status` instead of exiting with a
+  traceback, and refuse to publish while the profile's cached-only filter is missing.
+
 ## 0.2.4
 
 - Replace the deprecated Supervisor `watchdog` option and default `boot`/`startup`
