@@ -116,12 +116,20 @@ class IndexTests(unittest.TestCase):
         self.add(1)
         self.assertTrue(self.s.exposed_categories())
 
-    def test_switchover_keeps_catalogue_metadata(self):
-        # Learned categories stay published even when the family manifest no longer
-        # lists them, which is what makes a restart after switch-over safe.
+    def test_shelves_are_retired_when_the_source_drops_them(self):
+        # The catalogue source profile is authoritative, so removing a shelf there
+        # must remove it here instead of leaving a stale, frozen row.
         self.add(2)
-        self.s.add_categories([], 'cachedlibrary')
         self.assertEqual([c['name'] for c in self.s.exposed_categories()], ['Movies'])
+        self.s.add_categories([], 'cachedlibrary')
+        self.assertEqual(self.s.exposed_categories(), [])
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM membership').fetchone()[0], 0)
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM titles').fetchone()[0], 0)
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM checks').fetchone()[0], 0)
+        # Re-adding the shelf brings it back, freshly crawled.
+        self.s.add_categories([{'id': 'upstream.one', 'type': 'movie', 'name': 'Movies',
+                                'extra': [{'name': 'skip'}]}], 'cachedlibrary')
+        self.assertEqual([c['active'] for c in self.s.db.execute('SELECT active FROM categories')], [1])
 
 
 class ConfigurationTests(unittest.TestCase):

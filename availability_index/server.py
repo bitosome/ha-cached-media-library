@@ -104,7 +104,7 @@ class Store:
         self.db.executescript('''
           PRAGMA journal_mode=WAL;
           CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value TEXT);
-          CREATE TABLE IF NOT EXISTS categories (id TEXT PRIMARY KEY,type TEXT,name TEXT,upstream TEXT,position INTEGER,extra TEXT,offset INTEGER DEFAULT 0,done INTEGER DEFAULT 0,refresh REAL DEFAULT 0,generation REAL DEFAULT 0);
+          CREATE TABLE IF NOT EXISTS categories (id TEXT PRIMARY KEY,type TEXT,name TEXT,upstream TEXT,position INTEGER,extra TEXT,active INTEGER DEFAULT 1,offset INTEGER DEFAULT 0,done INTEGER DEFAULT 0,refresh REAL DEFAULT 0,generation REAL DEFAULT 0);
           CREATE TABLE IF NOT EXISTS titles (type TEXT,id TEXT,preview TEXT,meta TEXT,search TEXT,meta_due REAL DEFAULT 0,meta_checked REAL DEFAULT 0,priority INTEGER DEFAULT 9999,meta_claimed REAL DEFAULT 0,PRIMARY KEY(type,id));
           CREATE TABLE IF NOT EXISTS membership (category TEXT,type TEXT,id TEXT,rank INTEGER,seen REAL DEFAULT 0,PRIMARY KEY(category,type,id));
           CREATE TABLE IF NOT EXISTS checks (type TEXT,id TEXT,parent TEXT,status TEXT DEFAULT 'pending',checked REAL DEFAULT 0,expires REAL DEFAULT 0,due REAL DEFAULT 0,attempted REAL DEFAULT 0,failures INTEGER DEFAULT 0,count INTEGER DEFAULT 0,priority INTEGER DEFAULT 0,PRIMARY KEY(type,id));
@@ -117,7 +117,8 @@ class Store:
 
     def migrate(self):
         """Add columns introduced after a database was first created."""
-        wanted = {'titles': [('priority', 'INTEGER DEFAULT 9999'), ('meta_claimed', 'REAL DEFAULT 0')]}
+        wanted = {'titles': [('priority', 'INTEGER DEFAULT 9999'), ('meta_claimed', 'REAL DEFAULT 0')],
+                  'categories': [('active', 'INTEGER DEFAULT 1')]}
         for table, columns in wanted.items():
             existing = {row[1] for row in self.db.execute('PRAGMA table_info(%s)' % table)}
             for name, ddl in columns:
@@ -139,9 +140,11 @@ class Store:
             self.db.commit()
 
     def add_categories(self, catalogs, instance_id):
-        """Learn catalogues from the family profile. Known ones are never dropped:
-        the family profile hides them at switch-over, but indexing continues."""
+        """Reconcile the published shelves with the catalogue source. The source is a
+        dedicated profile that is never switched over, so its manifest is authoritative:
+        shelves it no longer offers are retired rather than left stale."""
         with self.lock:
+            self.db.execute('UPDATE categories SET active=0')
             for position, cat in enumerate(catalogs):
                 if cat.get('type') not in ('movie', 'series'):
                     continue
@@ -150,9 +153,18 @@ class Store:
                 if is_scanner_catalog(cat['id'], instance_id):
                     continue
                 cid = 'cached-' + hashlib.sha256((cat['type'] + '/' + cat['id']).encode()).hexdigest()[:16]
-                self.db.execute('''INSERT INTO categories(id,type,name,upstream,position,extra) VALUES (?,?,?,?,?,?)
-                  ON CONFLICT(id) DO UPDATE SET name=excluded.name,position=excluded.position,extra=excluded.extra''',
-                  (cid, cat['type'], cat.get('name', cat['id']), cat['id'], position, encode(cat.get('extra', []))))
+                self.db.execute(
+                    '''INSERT INTO categories(id,type,name,upstream,position,extra,active) VALUES (?,?,?,?,?,?,1)
+                       ON CONFLICT(id) DO UPDATE SET name=excluded.name,position=excluded.position,
+                       extra=excluded.extra,active=1''',
+                    (cid, cat['type'], cat.get('name', cat['id']), cat['id'], position, encode(cat.get('extra', []))))
+            retired = [row[0] for row in self.db.execute('SELECT id FROM categories WHERE active=0').fetchall()]
+            if retired:
+                marks = ','.join('?' for _ in retired)
+                self.db.execute('DELETE FROM membership WHERE category IN (%s)' % marks, retired)
+                # Titles and checks that no longer belong to any shelf are dropped.
+                self.db.execute('DELETE FROM checks WHERE NOT EXISTS (SELECT 1 FROM membership m WHERE m.type=checks.type AND m.id=checks.parent)')
+                self.db.execute('DELETE FROM titles WHERE NOT EXISTS (SELECT 1 FROM membership m WHERE m.type=titles.type AND m.id=titles.id)')
             self.db.commit()
 
     def add_page(self, cat, previews, offset, cap):
@@ -276,7 +288,7 @@ class Store:
         entry cannot leave a permanently empty shelf."""
         with self.lock:
             return self.db.execute('''SELECT c.* FROM categories c
-              WHERE c.done=0 OR EXISTS(SELECT 1 FROM membership m WHERE m.category=c.id)
+              WHERE c.active=1 AND (c.done=0 OR EXISTS(SELECT 1 FROM membership m WHERE m.category=c.id))
               ORDER BY c.position''').fetchall()
 
     def status(self):
@@ -287,7 +299,7 @@ class Store:
                 count = self.db.execute('''SELECT count(*) FROM membership m WHERE category=? AND EXISTS
                   (SELECT 1 FROM checks c WHERE c.type=m.type AND c.parent=m.id AND c.status='available' AND c.expires>?)''',
                   (c['id'], now + 60)).fetchone()[0]
-                categories.append({'name': c['name'], 'type': c['type'], 'verified_titles': count,
+                categories.append({'name': c['name'], 'type': c['type'], 'active': bool(c['active']), 'verified_titles': count,
                                    'candidates': self.db.execute('SELECT count(*) FROM membership WHERE category=?', (c['id'],)).fetchone()[0],
                                    'index_complete': bool(c['done'])})
             return {
@@ -434,7 +446,7 @@ class App:
                 self.stop.wait(3)
                 continue
             with self.store.lock:
-                cats = self.store.db.execute('SELECT * FROM categories ORDER BY offset,position').fetchall()
+                cats = self.store.db.execute('SELECT * FROM categories WHERE active=1 ORDER BY offset,position').fetchall()
             worked = False
             for cat in cats:
                 if cat['done'] and cat['refresh'] > time.time():
@@ -540,7 +552,7 @@ class App:
         for kind in ('movie', 'series'):
             catalogs.append({'id': 'cached-search', 'type': kind, 'name': 'Available ' + kind + ' search',
                              'extra': [{'name': 'search', 'isRequired': True}, {'name': 'skip', 'isRequired': False}]})
-        return {'id': 'local.cached.media.library', 'version': '0.4.0', 'name': 'Cached Media Library',
+        return {'id': 'local.cached.media.library', 'version': '0.5.0', 'name': 'Cached Media Library',
                 'description': 'Recently verified cached streams matching your AIOStreams filters. Metadata only.',
                 'types': ['movie', 'series'],
                 'resources': ['catalog', {'name': 'meta', 'types': ['movie', 'series'], 'idPrefixes': ['tt', 'tmdb:']}],

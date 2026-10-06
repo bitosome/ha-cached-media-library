@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0
+
+- Treat the catalogue-source profile as authoritative and retire shelves it no
+  longer offers, dropping their memberships, titles and checks. Previously the
+  shelf list could only ever grow, so a revised line-up left stale, frozen rows
+  behind. `metadata_pending` and the per-shelf `active` flag are reported in
+  `/status`.
+
 ## 0.4.0
 
 - Fetch metadata concurrently (`metadata_workers`) and claim titles atomically, so
