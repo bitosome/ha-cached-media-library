@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.0
+
+- Verify the most popular candidates first. Checks were ordered by identifier as a
+  tie-breaker, so `tt0…`/`tt1…` titles were verified long before a shelf's first
+  entry (`tt7678620`, i.e. Bluey, was last in its wave despite being rank 1). Titles
+  now carry the best shelf rank across their shelves, and both availability checks
+  and episode-list fetches order by shelf depth, then rank, then identifier.
+
 ## 0.5.0
 
 - Treat the catalogue-source profile as authoritative and retire shelves it no

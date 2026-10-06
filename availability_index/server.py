@@ -105,7 +105,7 @@ class Store:
           PRAGMA journal_mode=WAL;
           CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value TEXT);
           CREATE TABLE IF NOT EXISTS categories (id TEXT PRIMARY KEY,type TEXT,name TEXT,upstream TEXT,position INTEGER,extra TEXT,active INTEGER DEFAULT 1,offset INTEGER DEFAULT 0,done INTEGER DEFAULT 0,refresh REAL DEFAULT 0,generation REAL DEFAULT 0);
-          CREATE TABLE IF NOT EXISTS titles (type TEXT,id TEXT,preview TEXT,meta TEXT,search TEXT,meta_due REAL DEFAULT 0,meta_checked REAL DEFAULT 0,priority INTEGER DEFAULT 9999,meta_claimed REAL DEFAULT 0,PRIMARY KEY(type,id));
+          CREATE TABLE IF NOT EXISTS titles (type TEXT,id TEXT,preview TEXT,meta TEXT,search TEXT,meta_due REAL DEFAULT 0,meta_checked REAL DEFAULT 0,priority INTEGER DEFAULT 9999,rank INTEGER DEFAULT 999999,meta_claimed REAL DEFAULT 0,PRIMARY KEY(type,id));
           CREATE TABLE IF NOT EXISTS membership (category TEXT,type TEXT,id TEXT,rank INTEGER,seen REAL DEFAULT 0,PRIMARY KEY(category,type,id));
           CREATE TABLE IF NOT EXISTS checks (type TEXT,id TEXT,parent TEXT,status TEXT DEFAULT 'pending',checked REAL DEFAULT 0,expires REAL DEFAULT 0,due REAL DEFAULT 0,attempted REAL DEFAULT 0,failures INTEGER DEFAULT 0,count INTEGER DEFAULT 0,priority INTEGER DEFAULT 0,PRIMARY KEY(type,id));
           CREATE INDEX IF NOT EXISTS due_checks ON checks(due,priority);
@@ -117,7 +117,8 @@ class Store:
 
     def migrate(self):
         """Add columns introduced after a database was first created."""
-        wanted = {'titles': [('priority', 'INTEGER DEFAULT 9999'), ('meta_claimed', 'REAL DEFAULT 0')],
+        wanted = {'titles': [('priority', 'INTEGER DEFAULT 9999'), ('rank', 'INTEGER DEFAULT 999999'),
+                             ('meta_claimed', 'REAL DEFAULT 0')],
                   'categories': [('active', 'INTEGER DEFAULT 1')]}
         for table, columns in wanted.items():
             existing = {row[1] for row in self.db.execute('PRAGMA table_info(%s)' % table)}
@@ -182,10 +183,11 @@ class Store:
                 # Breadth first: the first page of every shelf is indexed before the
                 # second, and the curated family shelves come before everything else.
                 shelf = -100 if 'familycurated' in cat['upstream'] else offset // 20
-                self.db.execute('''INSERT INTO titles(type,id,preview,search,priority) VALUES (?,?,?,?,?)
+                self.db.execute('''INSERT INTO titles(type,id,preview,search,priority,rank) VALUES (?,?,?,?,?,?)
                   ON CONFLICT(type,id) DO UPDATE SET preview=excluded.preview,search=excluded.search,
-                  priority=CASE WHEN titles.priority<excluded.priority THEN titles.priority ELSE excluded.priority END''',
-                  (kind, ident, encode(p), folded(p.get('name', '')), shelf))
+                  priority=CASE WHEN titles.priority<excluded.priority THEN titles.priority ELSE excluded.priority END,
+                  rank=CASE WHEN titles.rank<excluded.rank THEN titles.rank ELSE excluded.rank END''',
+                  (kind, ident, encode(p), folded(p.get('name', '')), shelf, offset + n))
                 seen = self.db.execute('SELECT seen FROM membership WHERE category=? AND type=? AND id=?', (cat['id'], kind, ident)).fetchone()
                 new += int(seen is None or seen[0] != generation)
                 self.db.execute('''INSERT INTO membership VALUES (?,?,?,?,?) ON CONFLICT(category,type,id)
@@ -478,7 +480,7 @@ class App:
             row = self.store.db.execute('''SELECT t.* FROM titles t WHERE t.meta_due<? AND t.meta_claimed<?
               AND EXISTS(SELECT 1 FROM membership m WHERE m.type=t.type AND m.id=t.id)
               AND (t.type='series' OR EXISTS(SELECT 1 FROM checks c WHERE c.type=t.type AND c.parent=t.id AND c.status='available'))
-              ORDER BY (t.meta_checked>0),t.priority,t.meta_checked,t.id LIMIT 1''', (now, now)).fetchone()
+              ORDER BY (t.meta_checked>0),t.priority,t.rank,t.meta_checked,t.id LIMIT 1''', (now, now)).fetchone()
             if row:
                 self.store.db.execute('UPDATE titles SET meta_claimed=? WHERE type=? AND id=?',
                                       (now + 900, row['type'], row['id']))
@@ -505,11 +507,13 @@ class App:
     def next_check(self, preferred):
         with self.store.lock:
             # Refresh positives before they expire, then work the backlog.
-            rows = self.store.db.execute('''SELECT c.* FROM checks c WHERE due<? AND EXISTS
-              (SELECT 1 FROM membership m WHERE m.type=c.type AND m.id=c.parent)
-              ORDER BY CASE WHEN status='available' THEN 0 ELSE 1 END,(c.type!=?),priority,
-              (SELECT max(c2.attempted) FROM checks c2 WHERE c2.type=c.type AND c2.parent=c.parent),c.attempted,c.id LIMIT 100''',
-              (time.time(), preferred)).fetchall()
+            rows = self.store.db.execute('''SELECT c.* FROM checks c
+              LEFT JOIN titles t ON t.type=c.type AND t.id=c.parent
+              WHERE c.due<? AND EXISTS (SELECT 1 FROM membership m WHERE m.type=c.type AND m.id=c.parent)
+              ORDER BY CASE WHEN c.status='available' THEN 0 ELSE 1 END,(c.type!=?),
+              COALESCE(t.priority,9999),COALESCE(t.rank,999999),
+              (SELECT max(c2.attempted) FROM checks c2 WHERE c2.type=c.type AND c2.parent=c.parent),c.attempted,c.id
+              LIMIT 100''', (time.time(), preferred)).fetchall()
             for row in rows:
                 key = (row['type'], row['id'])
                 if key not in self.inflight:
@@ -552,7 +556,7 @@ class App:
         for kind in ('movie', 'series'):
             catalogs.append({'id': 'cached-search', 'type': kind, 'name': 'Available ' + kind + ' search',
                              'extra': [{'name': 'search', 'isRequired': True}, {'name': 'skip', 'isRequired': False}]})
-        return {'id': 'local.cached.media.library', 'version': '0.5.0', 'name': 'Cached Media Library',
+        return {'id': 'local.cached.media.library', 'version': '0.6.0', 'name': 'Cached Media Library',
                 'description': 'Recently verified cached streams matching your AIOStreams filters. Metadata only.',
                 'types': ['movie', 'series'],
                 'resources': ['catalog', {'name': 'meta', 'types': ['movie', 'series'], 'idPrefixes': ['tt', 'tmdb:']}],

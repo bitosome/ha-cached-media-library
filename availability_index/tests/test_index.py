@@ -199,6 +199,17 @@ class ConfigurationTests(unittest.TestCase):
             'SELECT id FROM titles ORDER BY priority,id').fetchall()]
         self.assertEqual(order, ['ttcurated', 'ttshallow', 'ttdeep'])
 
+    def test_most_popular_candidates_are_checked_first(self):
+        app = self.app()
+        app.store.add_categories([{'id': 'upstream.a', 'type': 'movie', 'name': 'Shelf',
+                                   'extra': [{'name': 'skip'}]}], 'cachedlibrary')
+        cat = app.store.db.execute('SELECT * FROM categories').fetchone()
+        # Page 2 is crawled first so the alphabetical order would be the wrong answer.
+        app.store.add_page(cat, [{'id': 'tt9', 'name': 'Unpopular'}], 20, 1000)
+        app.store.add_page(cat, [{'id': 'tt1', 'name': 'Popular'}], 0, 1000)
+        first = app.next_check('movie')
+        self.assertEqual(first['id'], 'tt1')
+
     def test_schema_migration_adds_new_columns(self):
         store = Store(self.tmp.name + '/migrated')
         columns = {row[1] for row in store.db.execute('PRAGMA table_info(titles)')}
