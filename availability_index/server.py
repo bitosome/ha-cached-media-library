@@ -131,6 +131,10 @@ class Store:
             # Ranks are recorded while crawling, so re-crawl once to populate them.
             # Verified results survive: checks are only inserted, never reset here.
             self.db.execute('UPDATE categories SET done=0,refresh=0,offset=0')
+        # Repair series that were recorded as fetched but produced no episode checks,
+        # which older versions could cache for a day (see the empty-list guard).
+        self.db.execute('''UPDATE titles SET meta_due=0,meta_checked=0 WHERE type='series' AND meta_checked>0
+          AND NOT EXISTS (SELECT 1 FROM checks c WHERE c.type='series' AND c.parent=titles.id)''')
 
     def setting(self, key, value=None):
         with self.lock:
@@ -301,6 +305,7 @@ class Store:
 
     def lookup(self, kind, ident):
         """Diagnostics for one title: why it is or is not published."""
+        now = time.time()
         with self.lock:
             title = self.db.execute('SELECT type,id,priority,rank,meta,meta_checked,meta_due,meta_claimed FROM titles WHERE type=? AND id=?',
                                     (kind, ident)).fetchone()
@@ -320,7 +325,7 @@ class Store:
                     'meta_claimed': title['meta_claimed'], 'episode_checks': episodes,
                     'memberships': [{'category': m['category'], 'rank': m['rank']} for m in memberships],
                     'checks': [{'status': c[0], 'count': c[1], 'earliest_due': c[2], 'latest_expiry': c[3]} for c in checks],
-                    'visible': self.visible(kind, ident, time.time())}
+                    'visible': self.visible(kind, ident, now)}
 
     def exposed_categories(self):
         """Catalogues worth publishing: still crawling, or proven to contain titles.
@@ -594,7 +599,7 @@ class App:
         for kind in ('movie', 'series'):
             catalogs.append({'id': 'cached-search', 'type': kind, 'name': 'Available ' + kind + ' search',
                              'extra': [{'name': 'search', 'isRequired': True}, {'name': 'skip', 'isRequired': False}]})
-        return {'id': 'local.cached.media.library', 'version': '0.6.3', 'name': 'Cached Media Library',
+        return {'id': 'local.cached.media.library', 'version': '0.6.5', 'name': 'Cached Media Library',
                 'description': 'Recently verified cached streams matching your AIOStreams filters. Metadata only.',
                 'types': ['movie', 'series'],
                 'resources': ['catalog', {'name': 'meta', 'types': ['movie', 'series'], 'idPrefixes': ['tt', 'tmdb:']}],

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.5
+
+- On startup, re-queue series that were recorded as fetched but have no episode
+  checks, so shows poisoned by the empty-list bug are retried instead of waiting up
+  to a day for their next metadata refresh.
+
+## 0.6.4
+
+- Fix a crash in the `/status?lookup=` diagnostic (`now` was undefined).
+
 ## 0.6.3
 
 - Never cache an episode list that yields no usable episodes. A metadata response
