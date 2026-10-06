@@ -46,6 +46,34 @@ CDN, never through Home Assistant.
 See [the app documentation](availability_index/DOCS.md) for the switch-over
 procedure, all options and troubleshooting.
 
+## Shelf line-up
+
+Shelves are not configured in this app. It mirrors whatever the **catalogue
+source profile** offers, in that profile's catalogue order, and retires shelves
+that are removed there. That keeps one source of truth for the line-up.
+
+The reference line-up is a genre-first, streaming-service-agnostic home screen —
+the debrid library is not Netflix or Disney+, so those labels say nothing about
+the content:
+
+| | |
+|---|---|
+| Recently added | Trending Movies, Trending Shows, New Release Movies, New Series |
+| Broadly popular | Popular Movies, Popular Shows |
+| Taste | Sci-Fi Movies, Sci-Fi & Fantasy Series, Fantasy Movies |
+| Films by genre | Action, Comedy, Drama, Thriller, Animation, Family |
+| Series by genre | Action & Adventure, Comedy, Crime & Mystery, Drama |
+| Children | Kids Shows, Лучшие мультсериалы, Советские мультфильмы, Лучшие фильмы |
+| Charts | Netflix Top 10 Movies (Global), Netflix Top 10 Shows (Global) |
+
+To revise it: change the catalogue source profile (add, remove, rename or
+reorder catalogues), then wait for the next synchronisation. Added shelves are
+crawled automatically; removed shelves are retired and their titles dropped.
+Order in the client follows the order in that profile.
+
+AIOStreams also caps how many shelves it exposes: raise `jellyfin.maxLibraries`
+if the client is missing the last few.
+
 ## Install
 
 1. In Home Assistant open **Settings → Apps → App store** (older versions:

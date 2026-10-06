@@ -58,6 +58,16 @@ AIOStreams hides disabled catalogues from clients and from client search, but it
 Stremio endpoint still serves them by id. The app also remembers the catalogue list
 in its database, so it keeps verifying new additions after the switch-over.
 
+### Revising the shelves
+
+Shelves come from the catalogue source profile, so that is the only place to edit
+them. Add, remove, rename or reorder catalogues there and the app reconciles on its
+next synchronisation: new shelves are crawled, removed shelves are retired along
+with their titles and checks, and client order follows that profile's order.
+
+AIOStreams truncates the list to `jellyfin.maxLibraries` (default 24), silently
+dropping the last shelves. Raise it above the number of shelves you publish.
+
 ### Reinstalling or starting fresh
 
 The app needs to learn which catalogues to index. After switch-over the family
