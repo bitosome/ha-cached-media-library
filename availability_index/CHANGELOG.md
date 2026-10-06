@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0
+
+- Fetch metadata concurrently (`metadata_workers`) and claim titles atomically, so
+  long-running shows with enormous episode lists no longer serialise the queue.
+  Measured metadata throughput was the limiting factor for series.
+- Order metadata breadth-first across shelves, with the curated family shelves
+  first, instead of by identifier. Previously every `tmdb:` title was fetched
+  before any `tt` title, so whole shelves waited behind one another.
+- Make the gap between availability checks configurable
+  (`check_delay_seconds`) and allow up to six check workers, so throughput can be
+  matched to the AIOStreams rate limit instead of being paced by a constant.
+- Report `metadata_pending` in `/status`.
+
 ## 0.3.1
 
 - Repeat the app's own validation message in the log and in `/status`, so a

@@ -53,8 +53,18 @@ configuration:
   workers:
     name: Concurrent checks
     description: >-
-      Parallel availability checks. Two stays under AIOStreams' Stremio stream
-      rate limit; higher values risk HTTP 429 responses.
+      Parallel availability checks. Keep this under AIOStreams' Stremio stream
+      rate limit, or the app backs off on HTTP 429 responses.
+  metadata_workers:
+    name: Concurrent metadata fetches
+    description: >-
+      Parallel episode-list fetches. Long-running shows return very large lists,
+      so a few workers keep series from queueing behind them.
+  check_delay_seconds:
+    name: Delay between checks (seconds)
+    description: >-
+      Pause each worker takes between availability checks. Lower is faster and
+      uses more of the stream rate limit.
   scanner_instance_id:
     name: AIOStreams add-on instance ID
     description: >-

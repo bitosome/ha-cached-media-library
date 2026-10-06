@@ -22,7 +22,9 @@ AIOStreams configuration.
 | `negative_hours` | How long a negative result is trusted before rechecking (1–168). |
 | `max_candidates_per_category` | How deep each catalogue is indexed (20–5000). |
 | `max_episodes_per_series` | Episode checks queued per show (1–100), newest seasons first. |
-| `workers` | Concurrent availability checks (1–2). |
+| `metadata_workers` | Concurrent episode-list fetches (1–6). Episode lists for long-running shows are large. |
+| `check_delay_seconds` | Pause each check worker takes between checks (0–10). |
+| `workers` | Concurrent availability checks (1–6). |
 | `scanner_instance_id` | AIOStreams `instanceId` of this app's preset. Used to avoid indexing itself. |
 
 ### Finding the Stremio credentials
@@ -115,6 +117,14 @@ the profile the app reads.
 **`Synchronisation failed (HTTPError ...)`.** Check `aiostreams_url`, the profile
 UUID/password pair and the Stremio credentials. A `404` usually means a wrong
 `stremio_uuid` or encrypted password; `401` means a wrong profile password.
+
+**Shelves look nearly empty straight after install.** The index verifies one
+candidate at a time, so coverage grows for hours. `/status` shows how far it has
+got: `verified_now` against `pending` plus `metadata_pending`. Nothing is being
+wrongly dropped — check a title directly against the profile's `/stream` endpoint
+to confirm the app agrees with AIOStreams. Series fill in last, because their
+episode checks only exist once the (sometimes very large) episode list has been
+fetched; `metadata_workers` and `check_delay_seconds` are the throughput levers.
 
 **Sections are empty.** Nothing has been verified yet, or every candidate really
 is uncached. Compare `/status` counts with the same title checked directly in

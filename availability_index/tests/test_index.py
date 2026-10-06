@@ -166,6 +166,38 @@ class ConfigurationTests(unittest.TestCase):
         self.assertNotEqual(other.catalog_source, other.source)
         self.assertTrue(other.catalog_source.endswith('/stremio/c/k'))
 
+    def test_metadata_is_claimed_once(self):
+        app = self.app()
+        app.store.add_categories([{'id': 'upstream.shows', 'type': 'series', 'name': 'Shows'}], 'cachedlibrary')
+        cat = app.store.db.execute('SELECT * FROM categories').fetchone()
+        app.store.add_page(cat, [{'id': 'tt1', 'name': 'Show'}], 0, 100)
+        first = app.claim_meta()
+        self.assertIsNotNone(first)
+        self.assertEqual(first['id'], 'tt1')
+        # A second worker must not pick the same title while it is being fetched.
+        self.assertIsNone(app.claim_meta())
+
+    def test_metadata_ordering_is_breadth_first_with_curated_shelves_first(self):
+        app = self.app()
+        app.store.add_categories([
+            {'id': 'upstream.a', 'type': 'series', 'name': 'Ordinary', 'extra': [{'name': 'skip'}]},
+            {'id': 'upstream.b', 'type': 'series', 'name': 'Curated', 'extra': [{'name': 'skip'}]},
+        ], 'cachedlibrary')
+        cats = app.store.db.execute('SELECT * FROM categories ORDER BY position').fetchall()
+        app.store.add_page(cats[0], [{'id': 'ttshallow', 'name': 'A'}], 0, 1000)
+        app.store.add_page(cats[0], [{'id': 'ttdeep', 'name': 'B'}], 400, 1000)
+        app.store.add_page(cats[1], [{'id': 'ttcurated', 'name': 'C'}], 0, 1000)
+        order = [row[0] for row in app.store.db.execute(
+            'SELECT id FROM titles ORDER BY priority,id').fetchall()]
+        self.assertEqual(order, ['ttcurated', 'ttshallow', 'ttdeep'])
+
+    def test_schema_migration_adds_new_columns(self):
+        store = Store(self.tmp.name + '/migrated')
+        columns = {row[1] for row in store.db.execute('PRAGMA table_info(titles)')}
+        self.assertIn('priority', columns)
+        self.assertIn('meta_claimed', columns)
+        store.db.close()
+
 
 if __name__ == '__main__':
     unittest.main()

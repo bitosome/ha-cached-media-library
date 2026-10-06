@@ -105,14 +105,24 @@ class Store:
           PRAGMA journal_mode=WAL;
           CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value TEXT);
           CREATE TABLE IF NOT EXISTS categories (id TEXT PRIMARY KEY,type TEXT,name TEXT,upstream TEXT,position INTEGER,extra TEXT,offset INTEGER DEFAULT 0,done INTEGER DEFAULT 0,refresh REAL DEFAULT 0,generation REAL DEFAULT 0);
-          CREATE TABLE IF NOT EXISTS titles (type TEXT,id TEXT,preview TEXT,meta TEXT,search TEXT,meta_due REAL DEFAULT 0,meta_checked REAL DEFAULT 0,PRIMARY KEY(type,id));
+          CREATE TABLE IF NOT EXISTS titles (type TEXT,id TEXT,preview TEXT,meta TEXT,search TEXT,meta_due REAL DEFAULT 0,meta_checked REAL DEFAULT 0,priority INTEGER DEFAULT 9999,meta_claimed REAL DEFAULT 0,PRIMARY KEY(type,id));
           CREATE TABLE IF NOT EXISTS membership (category TEXT,type TEXT,id TEXT,rank INTEGER,seen REAL DEFAULT 0,PRIMARY KEY(category,type,id));
           CREATE TABLE IF NOT EXISTS checks (type TEXT,id TEXT,parent TEXT,status TEXT DEFAULT 'pending',checked REAL DEFAULT 0,expires REAL DEFAULT 0,due REAL DEFAULT 0,attempted REAL DEFAULT 0,failures INTEGER DEFAULT 0,count INTEGER DEFAULT 0,priority INTEGER DEFAULT 0,PRIMARY KEY(type,id));
           CREATE INDEX IF NOT EXISTS due_checks ON checks(due,priority);
           CREATE INDEX IF NOT EXISTS parent_checks ON checks(type,parent,status,expires);
           CREATE INDEX IF NOT EXISTS title_memberships ON membership(type,id);
         ''')
+        self.migrate()
         self.db.commit()
+
+    def migrate(self):
+        """Add columns introduced after a database was first created."""
+        wanted = {'titles': [('priority', 'INTEGER DEFAULT 9999'), ('meta_claimed', 'REAL DEFAULT 0')]}
+        for table, columns in wanted.items():
+            existing = {row[1] for row in self.db.execute('PRAGMA table_info(%s)' % table)}
+            for name, ddl in columns:
+                if name not in existing:
+                    self.db.execute('ALTER TABLE %s ADD COLUMN %s %s' % (table, name, ddl))
 
     def setting(self, key, value=None):
         with self.lock:
@@ -157,17 +167,20 @@ class Store:
                 kind, ident = cat['type'], p['id']
                 p = {k: v for k, v in p.items() if k not in ('videos', 'streams')}
                 p['type'] = kind
-                self.db.execute('''INSERT INTO titles(type,id,preview,search) VALUES (?,?,?,?)
-                  ON CONFLICT(type,id) DO UPDATE SET preview=excluded.preview,search=excluded.search''',
-                  (kind, ident, encode(p), folded(p.get('name', ''))))
+                # Breadth first: the first page of every shelf is indexed before the
+                # second, and the curated family shelves come before everything else.
+                shelf = -100 if 'familycurated' in cat['upstream'] else offset // 20
+                self.db.execute('''INSERT INTO titles(type,id,preview,search,priority) VALUES (?,?,?,?,?)
+                  ON CONFLICT(type,id) DO UPDATE SET preview=excluded.preview,search=excluded.search,
+                  priority=CASE WHEN titles.priority<excluded.priority THEN titles.priority ELSE excluded.priority END''',
+                  (kind, ident, encode(p), folded(p.get('name', '')), shelf))
                 seen = self.db.execute('SELECT seen FROM membership WHERE category=? AND type=? AND id=?', (cat['id'], kind, ident)).fetchone()
                 new += int(seen is None or seen[0] != generation)
                 self.db.execute('''INSERT INTO membership VALUES (?,?,?,?,?) ON CONFLICT(category,type,id)
                   DO UPDATE SET rank=excluded.rank,seen=excluded.seen''', (cat['id'], kind, ident, offset + n, generation))
                 # Curated shelves are probed first, then page by page across the rest.
-                priority = -100 if 'familycurated' in cat['upstream'] else offset // 20
                 if kind == 'movie':
-                    self.db.execute('INSERT OR IGNORE INTO checks(type,id,parent,priority) VALUES (?,?,?,?)', (kind, ident, ident, priority))
+                    self.db.execute('INSERT OR IGNORE INTO checks(type,id,parent,priority) VALUES (?,?,?,?)', (kind, ident, ident, shelf))
             skip = any(e.get('name') == 'skip' for e in json.loads(cat['extra']))
             done = not previews or (offset > 0 and not new) or not skip or offset + len(previews) >= cap
             if done:
@@ -283,6 +296,7 @@ class Store:
                 'verified_now': self.db.execute("SELECT count(*) FROM checks WHERE status='available' AND expires>?", (now + 60,)).fetchone()[0],
                 'retrying': self.db.execute('SELECT count(*) FROM checks WHERE failures>0').fetchone()[0],
                 'pending': self.db.execute("SELECT count(*) FROM checks WHERE due<?", (now,)).fetchone()[0],
+                'metadata_pending': self.db.execute("SELECT count(*) FROM titles WHERE meta_due<?", (now,)).fetchone()[0],
             }
 
 
@@ -298,6 +312,7 @@ class App:
         self.stop = threading.Event()
         self.heartbeats = {}
         self.instance_id = options.get('scanner_instance_id', 'cachedlibrary')
+        self.delay = float(options.get('check_delay_seconds', 2))
         self.base = (options.get('aiostreams_url') or '').rstrip('/')
         self.source = self.stremio(options.get('stremio_uuid'), options.get('stremio_encrypted_password'))
         # Catalogue definitions come from a profile that is never switched over, so a
@@ -443,18 +458,29 @@ class App:
             if not worked:
                 self.stop.wait(30)
 
-    def metadata_loop(self):
+    def claim_meta(self):
+        """Claim one title for metadata fetching. Episode lists can be megabytes for
+        long-running shows, so this runs in several threads and must not double-pick."""
+        now = time.time()
+        with self.store.lock:
+            row = self.store.db.execute('''SELECT t.* FROM titles t WHERE t.meta_due<? AND t.meta_claimed<?
+              AND EXISTS(SELECT 1 FROM membership m WHERE m.type=t.type AND m.id=t.id)
+              AND (t.type='series' OR EXISTS(SELECT 1 FROM checks c WHERE c.type=t.type AND c.parent=t.id AND c.status='available'))
+              ORDER BY (t.meta_checked>0),t.priority,t.meta_checked,t.id LIMIT 1''', (now, now)).fetchone()
+            if row:
+                self.store.db.execute('UPDATE titles SET meta_claimed=? WHERE type=? AND id=?',
+                                      (now + 900, row['type'], row['id']))
+                self.store.db.commit()
+            return row
+
+    def metadata_worker(self, number):
         while not self.stop.is_set():
-            self.heartbeats['metadata'] = time.time()
+            self.heartbeats['metadata' + str(number)] = time.time()
             if not self.ready:
                 self.stop.wait(3)
                 continue
-            with self.store.lock:
-                row = self.store.db.execute('''SELECT t.* FROM titles t WHERE meta_due<?
-                  AND EXISTS(SELECT 1 FROM membership m WHERE m.type=t.type AND m.id=t.id)
-                  AND (t.type='series' OR EXISTS(SELECT 1 FROM checks c WHERE c.type=t.type AND c.parent=t.id AND c.status='available'))
-                  ORDER BY (meta_checked>0),(t.type='movie'),meta_checked,t.id LIMIT 1''', (time.time(),)).fetchone()
-            if not row:
+            row = self.claim_meta()
+            if row is None:
                 self.stop.wait(5)
                 continue
             try:
@@ -462,7 +488,7 @@ class App:
                 self.store.save_meta(row['type'], row['id'], result.get('meta'), time.time())
             except Exception:
                 self.store.save_meta(row['type'], row['id'], None, time.time())
-            self.stop.wait(0.5)
+            self.stop.wait(0.2)
 
     def next_check(self, preferred):
         with self.store.lock:
@@ -505,7 +531,7 @@ class App:
                     self.store.record(row['type'], row['id'], verdict, count, time.time())
             with self.store.lock:
                 self.inflight.discard((row['type'], row['id']))
-            self.stop.wait(2)
+            self.stop.wait(self.delay)
 
     def manifest(self):
         catalogs = []
@@ -514,14 +540,15 @@ class App:
         for kind in ('movie', 'series'):
             catalogs.append({'id': 'cached-search', 'type': kind, 'name': 'Available ' + kind + ' search',
                              'extra': [{'name': 'search', 'isRequired': True}, {'name': 'skip', 'isRequired': False}]})
-        return {'id': 'local.cached.media.library', 'version': '0.3.1', 'name': 'Cached Media Library',
+        return {'id': 'local.cached.media.library', 'version': '0.4.0', 'name': 'Cached Media Library',
                 'description': 'Recently verified cached streams matching your AIOStreams filters. Metadata only.',
                 'types': ['movie', 'series'],
                 'resources': ['catalog', {'name': 'meta', 'types': ['movie', 'series'], 'idPrefixes': ['tt', 'tmdb:']}],
                 'catalogs': catalogs, 'behaviorHints': {'configurable': False}, 'cacheMaxAge': 30}
 
     def start(self):
-        threads = [('sync', self.sync_loop), ('crawl', self.crawl_loop), ('metadata', self.metadata_loop)]
+        threads = [('sync', self.sync_loop), ('crawl', self.crawl_loop)]
+        threads += [('metadata' + str(i), lambda i=i: self.metadata_worker(i)) for i in range(self.o.get('metadata_workers', 2))]
         threads += [('worker' + str(i), lambda i=i: self.worker(i)) for i in range(self.o.get('workers', 2))]
         for name, func in threads:
             self.heartbeats[name] = time.time()
