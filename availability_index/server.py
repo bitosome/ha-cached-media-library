@@ -120,11 +120,17 @@ class Store:
         wanted = {'titles': [('priority', 'INTEGER DEFAULT 9999'), ('rank', 'INTEGER DEFAULT 999999'),
                              ('meta_claimed', 'REAL DEFAULT 0')],
                   'categories': [('active', 'INTEGER DEFAULT 1')]}
+        added = set()
         for table, columns in wanted.items():
             existing = {row[1] for row in self.db.execute('PRAGMA table_info(%s)' % table)}
             for name, ddl in columns:
                 if name not in existing:
                     self.db.execute('ALTER TABLE %s ADD COLUMN %s %s' % (table, name, ddl))
+                    added.add(name)
+        if 'rank' in added:
+            # Ranks are recorded while crawling, so re-crawl once to populate them.
+            # Verified results survive: checks are only inserted, never reset here.
+            self.db.execute('UPDATE categories SET done=0,refresh=0,offset=0')
 
     def setting(self, key, value=None):
         with self.lock:
@@ -556,7 +562,7 @@ class App:
         for kind in ('movie', 'series'):
             catalogs.append({'id': 'cached-search', 'type': kind, 'name': 'Available ' + kind + ' search',
                              'extra': [{'name': 'search', 'isRequired': True}, {'name': 'skip', 'isRequired': False}]})
-        return {'id': 'local.cached.media.library', 'version': '0.6.0', 'name': 'Cached Media Library',
+        return {'id': 'local.cached.media.library', 'version': '0.6.1', 'name': 'Cached Media Library',
                 'description': 'Recently verified cached streams matching your AIOStreams filters. Metadata only.',
                 'types': ['movie', 'series'],
                 'resources': ['catalog', {'name': 'meta', 'types': ['movie', 'series'], 'idPrefixes': ['tt', 'tmdb:']}],

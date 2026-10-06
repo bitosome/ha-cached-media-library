@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.1
+
+- Re-crawl once when the rank column is introduced, so existing shelves get ranks
+  immediately instead of waiting up to a day for their next refresh. Verified
+  results are preserved; only the crawl position is reset.
+
 ## 0.6.0
 
 - Verify the most popular candidates first. Checks were ordered by identifier as a
