@@ -1,0 +1,43 @@
+name: Cached Media Library
+version: "0.2.3"
+slug: availability_index
+description: Verified cached discovery and search for AIOStreams; read-only, never proxies video
+arch: [amd64, aarch64]
+startup: application
+boot: auto
+init: false
+backup: cold
+watchdog: http://[HOST]:[PORT:8097]/health
+ingress: true
+ingress_port: 8097
+panel_icon: mdi:movie-check
+ports:
+  8097/tcp: 8097
+ports_description:
+  8097/tcp: Stremio metadata API for AIOStreams (token-protected)
+options:
+  aiostreams_url: http://192.168.0.13:3000
+  active_uuid: ""
+  active_password: ""
+  stremio_uuid: ""
+  stremio_encrypted_password: ""
+  endpoint_token: ""
+  positive_hours: 12
+  negative_hours: 24
+  max_candidates_per_category: 250
+  max_episodes_per_series: 12
+  workers: 2
+  scanner_instance_id: cachedlibrary
+schema:
+  aiostreams_url: url
+  active_uuid: str
+  active_password: password
+  stremio_uuid: str
+  stremio_encrypted_password: password
+  endpoint_token: password
+  positive_hours: int(1,48)
+  negative_hours: int(1,168)
+  max_candidates_per_category: int(20,5000)
+  max_episodes_per_series: int(1,100)
+  workers: int(1,2)
+  scanner_instance_id: str(1,32)

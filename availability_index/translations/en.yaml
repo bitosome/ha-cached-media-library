@@ -1,0 +1,56 @@
+configuration:
+  aiostreams_url:
+    name: AIOStreams base URL
+    description: >-
+      Base URL of the AIOStreams instance, for example http://192.168.0.13:3000.
+  active_uuid:
+    name: Profile UUID
+    description: >-
+      UUID of the AIOStreams profile to mirror. Read only, to verify that the
+      cached-only filter is still enforced.
+  active_password:
+    name: Profile password
+    description: Password of that profile.
+  stremio_uuid:
+    name: Stremio endpoint UUID
+    description: >-
+      UUID used in the profile's Stremio endpoint. Usually the same as the
+      profile UUID.
+  stremio_encrypted_password:
+    name: Stremio encrypted password
+    description: >-
+      The profile's encrypted password, the last segment of its Stremio URL.
+  endpoint_token:
+    name: Endpoint token
+    description: >-
+      Private token protecting this app's Stremio endpoint. At least 24
+      characters. Treat it as a password.
+  positive_hours:
+    name: Positive result lifetime (hours)
+    description: How long a confirmed cached stream stays published.
+  negative_hours:
+    name: Negative result lifetime (hours)
+    description: How long a negative result is trusted before it is rechecked.
+  max_candidates_per_category:
+    name: Catalogue depth
+    description: >-
+      How deep each catalogue is indexed. Larger values give broader coverage
+      and take longer to complete. Search only covers what is indexed.
+  max_episodes_per_series:
+    name: Episode checks per series
+    description: >-
+      Episode checks queued per show, prioritising each newest season's opener.
+      Only confirmed episodes are exposed.
+  workers:
+    name: Concurrent checks
+    description: >-
+      Parallel availability checks. Two stays under AIOStreams' Stremio stream
+      rate limit; higher values risk HTTP 429 responses.
+  scanner_instance_id:
+    name: AIOStreams add-on instance ID
+    description: >-
+      The instanceId used when this app is added as a custom add-on in
+      AIOStreams. Used to avoid indexing its own catalogues.
+
+network:
+  8097/tcp: Stremio metadata API for AIOStreams (token-protected)
