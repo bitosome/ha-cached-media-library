@@ -107,7 +107,7 @@ class Store:
           CREATE TABLE IF NOT EXISTS categories (id TEXT PRIMARY KEY,type TEXT,name TEXT,upstream TEXT,position INTEGER,extra TEXT,active INTEGER DEFAULT 1,offset INTEGER DEFAULT 0,done INTEGER DEFAULT 0,refresh REAL DEFAULT 0,generation REAL DEFAULT 0);
           CREATE TABLE IF NOT EXISTS titles (type TEXT,id TEXT,preview TEXT,meta TEXT,search TEXT,meta_due REAL DEFAULT 0,meta_checked REAL DEFAULT 0,priority INTEGER DEFAULT 9999,rank INTEGER DEFAULT 999999,meta_claimed REAL DEFAULT 0,PRIMARY KEY(type,id));
           CREATE TABLE IF NOT EXISTS membership (category TEXT,type TEXT,id TEXT,rank INTEGER,seen REAL DEFAULT 0,PRIMARY KEY(category,type,id));
-          CREATE TABLE IF NOT EXISTS checks (type TEXT,id TEXT,parent TEXT,status TEXT DEFAULT 'pending',checked REAL DEFAULT 0,expires REAL DEFAULT 0,due REAL DEFAULT 0,attempted REAL DEFAULT 0,failures INTEGER DEFAULT 0,count INTEGER DEFAULT 0,priority INTEGER DEFAULT 0,PRIMARY KEY(type,id));
+          CREATE TABLE IF NOT EXISTS checks (type TEXT,id TEXT,parent TEXT,status TEXT DEFAULT 'pending',checked REAL DEFAULT 0,expires REAL DEFAULT 0,due REAL DEFAULT 0,attempted REAL DEFAULT 0,failures INTEGER DEFAULT 0,count INTEGER DEFAULT 0,priority INTEGER DEFAULT 0,PRIMARY KEY(type,id,parent));
           CREATE INDEX IF NOT EXISTS due_checks ON checks(due,priority);
           CREATE INDEX IF NOT EXISTS parent_checks ON checks(type,parent,status,expires);
           CREATE INDEX IF NOT EXISTS title_memberships ON membership(type,id);
@@ -131,6 +131,24 @@ class Store:
             # Ranks are recorded while crawling, so re-crawl once to populate them.
             # Verified results survive: checks are only inserted, never reset here.
             self.db.execute('UPDATE categories SET done=0,refresh=0,offset=0')
+        columns = {row[1]: row[5] for row in self.db.execute('PRAGMA table_info(checks)')}
+        if 'parent' in columns and [k for k, v in columns.items() if v] == ['type', 'id']:
+            # A title can be indexed under two identifiers (for example tmdb: and tt)
+            # that resolve to the same episodes. Keyed by (type,id) only, the second
+            # title's checks were silently discarded, so it could never be verified.
+            self.db.executescript('''
+              DROP INDEX IF EXISTS due_checks;
+              DROP INDEX IF EXISTS parent_checks;
+              ALTER TABLE checks RENAME TO checks_old;
+              CREATE TABLE checks (type TEXT,id TEXT,parent TEXT,status TEXT DEFAULT 'pending',checked REAL DEFAULT 0,expires REAL DEFAULT 0,due REAL DEFAULT 0,attempted REAL DEFAULT 0,failures INTEGER DEFAULT 0,count INTEGER DEFAULT 0,priority INTEGER DEFAULT 0,PRIMARY KEY(type,id,parent));
+              INSERT OR IGNORE INTO checks(type,id,parent,status,checked,expires,due,attempted,failures,count,priority)
+                SELECT type,id,parent,status,checked,expires,due,attempted,failures,count,priority FROM checks_old;
+              DROP TABLE checks_old;
+              CREATE INDEX IF NOT EXISTS due_checks ON checks(due,priority);
+              CREATE INDEX IF NOT EXISTS parent_checks ON checks(type,parent,status,expires);
+            ''')
+            # Re-queue so episodes whose checks were discarded are picked up again.
+            self.db.execute("UPDATE titles SET meta_due=0,meta_checked=0 WHERE type='series'")
         # Repair series that were recorded as fetched but produced no episode checks,
         # which older versions could cache for a day (see the empty-list guard).
         self.db.execute('''UPDATE titles SET meta_due=0,meta_checked=0 WHERE type='series' AND meta_checked>0
@@ -244,20 +262,20 @@ class Store:
                         self.db.execute('DELETE FROM checks WHERE type=? AND id=?', (kind, row['id']))
             self.db.commit()
 
-    def record(self, kind, ident, verdict, count, now):
+    def record(self, kind, ident, parent, verdict, count, now):
         with self.lock:
-            row = self.db.execute('SELECT * FROM checks WHERE type=? AND id=?', (kind, ident)).fetchone()
+            row = self.db.execute('SELECT * FROM checks WHERE type=? AND id=? AND parent=?', (kind, ident, parent)).fetchone()
             if row is None:
                 return
             if verdict == 'error':
                 failures = row['failures'] + 1
                 # A failure never extends an earlier positive confirmation.
-                self.db.execute('UPDATE checks SET due=?,attempted=?,failures=? WHERE type=? AND id=?',
-                                (now + min(3600, 120 * 2 ** min(failures, 5)), now, failures, kind, ident))
+                self.db.execute('UPDATE checks SET due=?,attempted=?,failures=? WHERE type=? AND id=? AND parent=?',
+                                (now + min(3600, 120 * 2 ** min(failures, 5)), now, failures, kind, ident, parent))
             else:
                 ttl = self.positive if verdict == 'available' else self.negative
                 self.db.execute('''UPDATE checks SET status=?,checked=?,expires=?,due=?,attempted=?,failures=0,count=?
-                  WHERE type=? AND id=?''', (verdict, now, now + ttl, now + ttl * .8, now, count, kind, ident))
+                  WHERE type=? AND id=? AND parent=?''', (verdict, now, now + ttl, now + ttl * .8, now, count, kind, ident, parent))
             self.db.commit()
 
     def visible(self, kind, ident, now):
@@ -587,7 +605,7 @@ class App:
                 verdict, count = 'error', 0
             with self.policy_lock:
                 if self.ready and generation == self.store.setting('policy'):
-                    self.store.record(row['type'], row['id'], verdict, count, time.time())
+                    self.store.record(row['type'], row['id'], row['parent'], verdict, count, time.time())
             with self.store.lock:
                 self.inflight.discard((row['type'], row['id']))
             self.stop.wait(self.delay)
@@ -599,7 +617,7 @@ class App:
         for kind in ('movie', 'series'):
             catalogs.append({'id': 'cached-search', 'type': kind, 'name': 'Available ' + kind + ' search',
                              'extra': [{'name': 'search', 'isRequired': True}, {'name': 'skip', 'isRequired': False}]})
-        return {'id': 'local.cached.media.library', 'version': '0.6.5', 'name': 'Cached Media Library',
+        return {'id': 'local.cached.media.library', 'version': '0.6.6', 'name': 'Cached Media Library',
                 'description': 'Recently verified cached streams matching your AIOStreams filters. Metadata only.',
                 'types': ['movie', 'series'],
                 'resources': ['catalog', {'name': 'meta', 'types': ['movie', 'series'], 'idPrefixes': ['tt', 'tmdb:']}],

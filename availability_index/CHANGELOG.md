@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.6
+
+- Key availability checks by `(title, episode)` instead of `(title, episode id)`.
+  A show indexed under two identifiers — `tmdb:82728` from the TMDB shelves and
+  `tt7678620` from the genre shelves, for example — resolves to the same episode
+  ids, and the second title's checks were silently discarded by the primary key.
+  That title could therefore never be verified: it stayed invisible no matter how
+  many cached streams it had. Existing databases are migrated on start and series
+  are re-queued once.
+
 ## 0.6.5
 
 - On startup, re-queue series that were recorded as fetched but have no episode

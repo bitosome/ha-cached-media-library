@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -32,7 +33,7 @@ class IndexTests(unittest.TestCase):
     def test_filter_before_pagination_and_search(self):
         self.add(220)
         for i in range(220):
-            self.s.record('movie', 'tt%07d' % i, 'available' if i % 2 else 'unavailable', 1, 1000)
+            self.s.record('movie', 'tt%07d' % i, 'tt%07d' % i, 'available' if i % 2 else 'unavailable', 1, 1000)
         first = self.s.catalog('movie', self.cat['id'], now=1001)
         second = self.s.catalog('movie', self.cat['id'], skip=100, now=1001)
         self.assertEqual(len(first), 100)
@@ -42,8 +43,8 @@ class IndexTests(unittest.TestCase):
 
     def test_failure_does_not_extend_positive_and_policy_invalidates(self):
         self.add()
-        self.s.record('movie', 'tt0000000', 'available', 1, 1000)
-        self.s.record('movie', 'tt0000000', 'error', 0, 4000)
+        self.s.record('movie', 'tt0000000', 'tt0000000', 'available', 1, 1000)
+        self.s.record('movie', 'tt0000000', 'tt0000000', 'error', 0, 4000)
         self.assertIsNotNone(self.s.meta('movie', 'tt0000000', 4001))
         self.assertIsNone(self.s.meta('movie', 'tt0000000', 4601))
         self.s.invalidate()
@@ -51,8 +52,8 @@ class IndexTests(unittest.TestCase):
 
     def test_uncached_and_unknown_never_visible(self):
         self.add(3)
-        self.s.record('movie', 'tt0000000', 'error', 0, 1000)
-        self.s.record('movie', 'tt0000001', 'unavailable', 0, 1000)
+        self.s.record('movie', 'tt0000000', 'tt0000000', 'error', 0, 1000)
+        self.s.record('movie', 'tt0000001', 'tt0000001', 'unavailable', 0, 1000)
         self.assertEqual(self.s.catalog('movie', self.cat['id'], now=1001), [])
 
     def test_series_only_confirmed_aired_episodes(self):
@@ -66,7 +67,7 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(self.s.db.execute('SELECT count(*) FROM checks').fetchone()[0], 2)
         self.assertEqual(self.s.db.execute('SELECT count(*) FROM checks WHERE id=?', ('tt123:1:4',)).fetchone()[0], 0)
         self.assertIsNone(self.s.meta('series', 'tt123', NOW + 1))
-        self.s.record('series', 'tt123:1:2', 'available', 1, NOW)
+        self.s.record('series', 'tt123:1:2', 'tt123', 'available', 1, NOW)
         meta = self.s.meta('series', 'tt123', NOW + 1)
         self.assertEqual([v['id'] for v in meta['videos']], ['tt123:1:2'])
         self.assertEqual(len(self.s.catalog('series', 'cached-search', search='ежик', now=NOW + 1)), 1)
@@ -209,6 +210,36 @@ class ConfigurationTests(unittest.TestCase):
         app.store.add_page(cat, [{'id': 'tt1', 'name': 'Popular'}], 0, 1000)
         first = app.next_check('movie')
         self.assertEqual(first['id'], 'tt1')
+
+    def test_same_episode_can_be_checked_for_two_identifiers(self):
+        # The same show is indexed twice when one catalogue uses `tmdb:` ids and
+        # another uses `tt` ids, but both resolve to the same episode ids.
+        store = Store(self.tmp.name + '/dup')
+        store.add_categories([{'id': 'u.a', 'type': 'series', 'name': 'A'}, {'id': 'u.b', 'type': 'series', 'name': 'B'}], 'cachedlibrary')
+        for cat in store.db.execute("SELECT * FROM categories WHERE type='series'").fetchall():
+            ident = 'tt5' if 'A' in cat['name'] else 'tmdb:5'
+            store.add_page(cat, [{'id': ident, 'name': 'Bluey'}], 0, 100)
+            store.save_meta('series', ident, {'id': ident, 'name': 'Bluey', 'videos': [
+                {'id': 'tt5:1:1', 'season': 1, 'episode': 1, 'released': PAST}]}, NOW)
+        self.assertEqual(store.db.execute("SELECT count(*) FROM checks WHERE id='tt5:1:1'").fetchone()[0], 2)
+        store.record('series', 'tt5:1:1', 'tt5', 'available', 1, NOW)
+        self.assertIsNotNone(store.meta('series', 'tt5', NOW + 1))
+        # The other identifier keeps its own pending check rather than losing it.
+        self.assertIsNone(store.meta('series', 'tmdb:5', NOW + 1))
+        store.db.close()
+
+    def test_checks_key_is_migrated_from_type_and_id(self):
+        path = self.tmp.name + '/legacy'
+        db = sqlite3.connect(path)
+        db.executescript("CREATE TABLE checks (type TEXT,id TEXT,parent TEXT,status TEXT DEFAULT 'pending',checked REAL,expires REAL,due REAL,attempted REAL,failures INTEGER DEFAULT 0,count INTEGER DEFAULT 0,priority INTEGER DEFAULT 0,PRIMARY KEY(type,id));")
+        db.execute("INSERT INTO checks(type,id,parent) VALUES ('series','tt5:1:1','tt5')")
+        db.commit()
+        db.close()
+        store = Store(path)
+        keys = [row[1] for row in store.db.execute('PRAGMA table_info(checks)') if row[5]]
+        self.assertEqual(keys, ['type', 'id', 'parent'])
+        self.assertEqual(store.db.execute('SELECT count(*) FROM checks').fetchone()[0], 1)
+        store.db.close()
 
     def test_schema_migration_adds_new_columns(self):
         store = Store(self.tmp.name + '/migrated')
