@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.1
+
+- Repeat the app's own validation message in the log and in `/status`, so a
+  configuration problem is readable instead of showing only the exception type.
+  Provider errors still omit the text, because those messages embed request URLs
+  that carry credentials.
+
 ## 0.3.0
 
 - Fix a bootstrap deadlock: after switch-over the family manifest contains only this

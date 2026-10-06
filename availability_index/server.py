@@ -399,8 +399,14 @@ class App:
             try:
                 self.synchronize()
             except Exception as exc:
-                # Never log exception text: request URLs contain credentials.
-                detail = ' ' + str(exc.code) if isinstance(exc, HTTPError) else ''
+                # urllib errors embed the request URL, which carries credentials, so
+                # only our own validation text is repeated verbatim.
+                if isinstance(exc, HTTPError):
+                    detail = ' HTTP ' + str(exc.code)
+                elif isinstance(exc, ValueError):
+                    detail = ': ' + str(exc)
+                else:
+                    detail = ''
                 self.ready, self.error = False, 'Synchronisation failed (' + type(exc).__name__ + detail + ')'
                 print(self.error, flush=True)
             self.heartbeats['sync'] = time.time()
@@ -508,7 +514,7 @@ class App:
         for kind in ('movie', 'series'):
             catalogs.append({'id': 'cached-search', 'type': kind, 'name': 'Available ' + kind + ' search',
                              'extra': [{'name': 'search', 'isRequired': True}, {'name': 'skip', 'isRequired': False}]})
-        return {'id': 'local.cached.media.library', 'version': '0.3.0', 'name': 'Cached Media Library',
+        return {'id': 'local.cached.media.library', 'version': '0.3.1', 'name': 'Cached Media Library',
                 'description': 'Recently verified cached streams matching your AIOStreams filters. Metadata only.',
                 'types': ['movie', 'series'],
                 'resources': ['catalog', {'name': 'meta', 'types': ['movie', 'series'], 'idPrefixes': ['tt', 'tmdb:']}],
