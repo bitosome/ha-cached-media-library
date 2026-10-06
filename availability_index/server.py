@@ -220,7 +220,16 @@ class Store:
             self.db.execute('UPDATE titles SET meta=?,meta_due=?,meta_checked=?,search=search || ? WHERE type=? AND id=?',
                             (encode(meta), now + 86400, now, ' ' + folded(meta.get('name', '')), kind, ident))
             if kind == 'series':
-                videos = sorted((v for v in meta.get('videos', []) if aired(v, now)), key=episode_order)[:self.max_episodes]
+                listed = meta.get('videos') or []
+                videos = sorted((v for v in listed if aired(v, now)), key=episode_order)[:self.max_episodes]
+                if not videos:
+                    # An episode list that yields nothing usable is a failed fetch,
+                    # not evidence about the show. Keep existing checks and retry soon
+                    # rather than caching emptiness for a day.
+                    self.db.execute('UPDATE titles SET meta_checked=?,meta_due=? WHERE type=? AND id=?',
+                                    (now, now + 1800, kind, ident))
+                    self.db.commit()
+                    return
                 curated = self.db.execute("SELECT 1 FROM membership m JOIN categories c ON c.id=m.category WHERE m.type=? AND m.id=? AND c.upstream LIKE 'familycurated%' LIMIT 1", (kind, ident)).fetchone()
                 for video in videos:
                     self.db.execute('INSERT OR IGNORE INTO checks(type,id,parent,priority) VALUES (?,?,?,?)',
@@ -293,7 +302,7 @@ class Store:
     def lookup(self, kind, ident):
         """Diagnostics for one title: why it is or is not published."""
         with self.lock:
-            title = self.db.execute('SELECT type,id,priority,rank,meta_checked,meta_due,meta_claimed FROM titles WHERE type=? AND id=?',
+            title = self.db.execute('SELECT type,id,priority,rank,meta,meta_checked,meta_due,meta_claimed FROM titles WHERE type=? AND id=?',
                                     (kind, ident)).fetchone()
             if title is None:
                 return {'known': False}
@@ -302,7 +311,11 @@ class Store:
             checks = self.db.execute('SELECT status,count(*),min(due),max(expires) FROM checks WHERE type=? AND parent=? GROUP BY status',
                                      (kind, ident)).fetchall()
             episodes = self.db.execute('SELECT count(*) FROM checks WHERE type=? AND parent=?', (kind, ident)).fetchone()[0]
+            stored = json.loads(title['meta']) if title['meta'] else {}
+            listed = stored.get('videos') or []
             return {'known': True, 'type': title['type'], 'id': title['id'], 'priority': title['priority'],
+                    'stored_meta': bool(title['meta']), 'stored_videos': len(listed),
+                    'stored_videos_aired': sum(1 for v in listed if aired(v, now)),
                     'rank': title['rank'], 'meta_checked': title['meta_checked'], 'meta_due': title['meta_due'],
                     'meta_claimed': title['meta_claimed'], 'episode_checks': episodes,
                     'memberships': [{'category': m['category'], 'rank': m['rank']} for m in memberships],
@@ -581,7 +594,7 @@ class App:
         for kind in ('movie', 'series'):
             catalogs.append({'id': 'cached-search', 'type': kind, 'name': 'Available ' + kind + ' search',
                              'extra': [{'name': 'search', 'isRequired': True}, {'name': 'skip', 'isRequired': False}]})
-        return {'id': 'local.cached.media.library', 'version': '0.6.2', 'name': 'Cached Media Library',
+        return {'id': 'local.cached.media.library', 'version': '0.6.3', 'name': 'Cached Media Library',
                 'description': 'Recently verified cached streams matching your AIOStreams filters. Metadata only.',
                 'types': ['movie', 'series'],
                 'resources': ['catalog', {'name': 'meta', 'types': ['movie', 'series'], 'idPrefixes': ['tt', 'tmdb:']}],

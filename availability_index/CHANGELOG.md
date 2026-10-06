@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.3
+
+- Never cache an episode list that yields no usable episodes. A metadata response
+  with no videos (or none with an air date) was recorded as a success and kept for
+  24 hours, so the show could not be verified for a day — and because the pruner
+  keeps only listed episodes, it also deleted episodes that had already been
+  verified. Such a response now keeps existing checks and retries in 30 minutes.
+- `/status?lookup=` also reports the stored metadata's episode counts.
+
 ## 0.6.2
 
 - Add `/status?lookup=<id>` (or `movie:<id>`) reporting why one title is or is not
