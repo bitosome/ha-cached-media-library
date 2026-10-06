@@ -1,13 +1,10 @@
 name: Cached Media Library
-version: "0.2.3"
+version: "0.2.4"
 slug: availability_index
 description: Verified cached discovery and search for AIOStreams; read-only, never proxies video
 arch: [amd64, aarch64]
-startup: application
-boot: auto
 init: false
 backup: cold
-watchdog: http://[HOST]:[PORT:8097]/health
 ingress: true
 ingress_port: 8097
 panel_icon: mdi:movie-check

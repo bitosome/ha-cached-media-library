@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.4
+
+- Replace the deprecated Supervisor `watchdog` option and default `boot`/`startup`
+  keys with a Docker `HEALTHCHECK`, as required by the Home Assistant add-on
+  linter. The app answers `503` on `/health` until it has synchronised.
+
 ## 0.2.3
 
 - Package the app as a standalone, publishable Home Assistant app repository.

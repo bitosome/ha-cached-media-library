@@ -73,7 +73,7 @@ list, so it keeps verifying new additions after the switch-over.
 
 | Endpoint | Purpose |
 | --- | --- |
-| `/health` | `200` when ready and all workers are recent; `503` otherwise. Used by the app watchdog. |
+| `/health` | `200` when ready and all workers are recent; `503` otherwise. Used by the image's `HEALTHCHECK`. |
 | `/status` | Readiness, issue text, per-category verified/candidate counts, backlog and worker ages. |
 
 Both are unauthenticated and deliberately expose no credentials, URLs or tokens.
@@ -97,6 +97,12 @@ hidden until a cached copy appears.
 **A title is missing from search.** It has not been indexed yet, or it has no
 cached stream. Verify it directly against the profile's `/stream` endpoint.
 
-**`watchdog` must be a URL.** In `config.yaml`, `watchdog` is a URL string
-(`http://[HOST]:[PORT:8097]/health`). Setting it to `true` makes the Supervisor
-reject the app's configuration and drop it from the store.
+**The app reports unhealthy.** `/health` answers `503` until the profile has been
+read successfully and all workers are recent, so a freshly started app is briefly
+unhealthy by design. If it stays unhealthy, check the log for a synchronisation
+failure and confirm the AIOStreams options.
+
+**Do not add a `watchdog` key to `config.yaml`.** The Supervisor `watchdog` option
+is obsolete; the Home Assistant add-on linter rejects it, and a boolean value makes
+the Supervisor drop the app from the store. Container health is reported by the
+image `HEALTHCHECK`, which polls `/health`.
