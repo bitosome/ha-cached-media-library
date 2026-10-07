@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.1
+
+- Prioritise pending checks and original metadata for a title opened or searched
+  by a client, with a five-minute per-title cooldown. This advances discovery
+  during the initial rebuild without publishing unverified results.
+
 ## 0.7.0
 
 - Require a separate source profile for upstream catalogues and complete metadata.

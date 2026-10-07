@@ -125,6 +125,10 @@ genre metadata cannot be assigned reliably. Known IMDb/TMDB aliases are combined
 where metadata establishes that they identify the same title; translated names
 remain searchable across catalogue refreshes.
 
+Opening or searching for a known title advances its pending checks, with a
+five-minute cooldown per title. Unverified results stay hidden; retry the search
+after the checks complete. This priority does not bypass the shared request limit.
+
 **Search covers indexed candidates only.** A cached title outside those catalogues
 or their configured depth will not appear. Raising catalogue depth improves
 coverage at the cost of more checking. On-demand upstream discovery is not part

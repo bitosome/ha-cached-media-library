@@ -1,5 +1,5 @@
 name: Cached Media Library
-version: "0.7.0"
+version: "0.7.1"
 slug: availability_index
 description: Verified cached discovery and search for AIOStreams; read-only, never proxies video
 arch: [amd64, aarch64]

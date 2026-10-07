@@ -137,4 +137,21 @@ class AppIntegrationTests(unittest.TestCase):
         row=self.app.store.db.execute("SELECT status,expires,failures FROM checks WHERE id='tt1:1:1'").fetchone()
         self.assertEqual((row['status'],row['expires'],row['failures']),('available',expiry,1))
 
+    def test_client_interest_advances_checks_without_publishing_pending_results(self):
+        self.save('tt1');self.save('tt2')
+        self.app.prioritize('series',search='Show Two')
+        self.assertEqual(self.app.store.catalog('series','cached-search',search='Show Two'),[])
+        self.assertIsNone(self.app.store.meta('series','tt2'))
+        row=self.app.next_check('series')
+        self.assertEqual(row['parent'],'tt2')
+        touched=self.app.store.db.execute("SELECT scan_touched FROM titles WHERE id='tt2'").fetchone()[0]
+        self.app.prioritize('series',ident='tt2')
+        self.assertEqual(self.app.store.db.execute("SELECT scan_touched FROM titles WHERE id='tt2'").fetchone()[0],touched)
+
+    def test_interest_prioritizes_original_metadata_and_ignores_unknown_titles(self):
+        self.app.prioritize('series',ident='unknown')
+        self.assertEqual(self.app.interest_times,{})
+        self.app.prioritize('series',ident='tt2')
+        self.assertEqual(self.app.claim_meta()['id'],'tt2')
+
 if __name__=='__main__':unittest.main()

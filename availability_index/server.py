@@ -572,6 +572,7 @@ class App:
         self.heartbeats = {}
         self.threads = {}
         self.worker_errors = {}
+        self.interest_times = {}
         self.pacing_lock = threading.Lock()
         self.next_stream_request = 0.0
         self.cooldown_until = 0.0
@@ -774,12 +775,37 @@ class App:
             row = self.store.db.execute('''SELECT t.type,t.id FROM titles t WHERE t.meta_due<? AND t.meta_claimed<?
               AND EXISTS(SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category WHERE m.type=t.type AND m.id=t.id AND cat.active=1)
               AND (t.type='series' OR EXISTS(SELECT 1 FROM checks c WHERE c.type=t.type AND c.parent=t.id AND c.status='available'))
-              ORDER BY (t.meta_checked>0),t.priority,t.rank,t.meta_checked,t.id LIMIT 1''', (now, now)).fetchone()
+              ORDER BY (t.scan_touched<0) DESC,(t.meta_checked>0),t.priority,t.rank,t.meta_checked,t.id LIMIT 1''', (now, now)).fetchone()
             if row:
                 self.store.db.execute('UPDATE titles SET meta_claimed=? WHERE type=? AND id=?',
                                       (now + 900, row['type'], row['id']))
                 self.store.db.commit()
             return row
+
+    def prioritize(self, kind, ident=None, search=None):
+        """An actual client visit can advance pending work, never its verdict."""
+        now = time.time()
+        with self.store.lock:
+            where, value = ('t.id=?', ident) if ident is not None else ('instr(t.search,?)>0', folded(search or ''))
+            if not value:
+                return
+            rows = self.store.db.execute('''SELECT t.id FROM titles t WHERE t.type=? AND '''+where+'''
+              AND EXISTS(SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category
+                         WHERE m.type=t.type AND m.id=t.id AND cat.active=1)
+              ORDER BY t.rank,t.id LIMIT 20''',(kind,value)).fetchall()
+            promoted = False
+            for row in rows:
+                key = (kind,row['id'])
+                if self.interest_times.get(key,0) > now-300:
+                    continue
+                self.interest_times[key] = now
+                self.store.db.execute('UPDATE titles SET scan_touched=? WHERE type=? AND id=?',(-now,kind,row['id']))
+                promoted = True
+            if promoted:
+                self.check_queue.clear()
+                self.store.db.commit()
+            if len(self.interest_times)>1000:
+                self.interest_times = {k:v for k,v in self.interest_times.items() if v>now-300}
 
     def metadata_worker(self, number):
         while not self.stop.is_set():
@@ -882,7 +908,7 @@ class App:
         for kind in ('movie', 'series'):
             catalogs.append({'id': 'cached-search', 'type': kind, 'name': 'Available ' + kind + ' search',
                              'extra': [{'name': 'search', 'isRequired': True}, {'name': 'skip', 'isRequired': False}]})
-        return {'id': 'local.cached.media.library', 'version': '0.7.0', 'name': 'Cached Media Library',
+        return {'id': 'local.cached.media.library', 'version': '0.7.1', 'name': 'Cached Media Library',
                 'description': 'Recently verified cached streams matching your AIOStreams filters. Metadata only.',
                 'types': ['movie', 'series'],
                 'resources': ['catalog', {'name': 'meta', 'types': ['movie', 'series'], 'idPrefixes': ['tt', 'tmdb:']}],
@@ -961,6 +987,7 @@ class Handler(BaseHTTPRequestHandler):
         kind = parts[2]
         ident = unquote(parts[3].removesuffix('.json') if len(parts) == 4 else parts[3])
         if parts[1] == 'meta':
+            app.prioritize(kind,ident=ident)
             self.send({'meta': app.store.meta(kind, ident), 'cacheMaxAge': 30, 'staleRevalidate': 0, 'staleError': 0})
             return
         if parts[1] != 'catalog':
@@ -972,6 +999,8 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             skip = 0
         search = extra.get('search', [None])[0]
+        if ident == 'cached-search' and search:
+            app.prioritize(kind,search=search)
         if ident == 'cached-search' and not search:
             metas = []
         else:
