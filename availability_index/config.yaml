@@ -1,5 +1,5 @@
 name: Cached Media Library
-version: "0.7.1"
+version: "0.7.2"
 slug: availability_index
 description: Verified cached discovery and search for AIOStreams; read-only, never proxies video
 arch: [amd64, aarch64]
@@ -30,6 +30,7 @@ options:
   check_delay_seconds: 1.5
   stream_requests_per_minute: 30
   scanner_instance_id: cachedlibrary
+  recovery_snapshot: ""
 schema:
   aiostreams_url: url
   active_uuid: str
@@ -48,3 +49,4 @@ schema:
   check_delay_seconds: float(0,10)
   stream_requests_per_minute: int(1,600)
   scanner_instance_id: str(1,32)
+  recovery_snapshot: password?

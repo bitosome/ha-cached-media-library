@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.2
+
+- Keep separate movie and series work queues so episode batches cannot consume
+  movie turns. Probe unverified shows one episode at a time across the catalogue
+  before expanding already confirmed or explicitly requested titles. Expired
+  historical positives rejoin ordinary scheduling instead of starving new work.
+- Add a one-time administrator recovery option for still-valid confirmations
+  invalidated by the 0.7.0 fingerprint migration. Import requires the same effective
+  playback policy, preserves original expiry times, and never replaces newer
+  conclusive checks or publishes records outside the active library. Recovery is
+  idempotent and its result is reported in status.
+
 ## 0.7.1
 
 - Prioritise pending checks and original metadata for a title opened or searched

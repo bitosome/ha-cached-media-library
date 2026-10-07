@@ -57,7 +57,9 @@ class AppIntegrationTests(unittest.TestCase):
             picked.append((row['parent'],row['id']))
             self.app.store.record(row['type'],row['id'],row['parent'],'available',1,time.time())
             self.app.inflight.discard((row['type'],row['id'],row['parent']))
-        self.assertEqual([p for p,_ in picked[:4]],['tt1','tt1','tt2','tt2'])
+        # Probe each previously unverified show once before expanding the now
+        # verified first show in a two-episode batch.
+        self.assertEqual([p for p,_ in picked[:4]],['tt1','tt2','tt1','tt1'])
         self.assertEqual(len(set(picked)),10)
         self.assertIn(('tt1','tt1:1:5'),picked)
         self.assertIsNone(self.app.next_check('series'))

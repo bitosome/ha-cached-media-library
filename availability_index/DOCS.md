@@ -64,6 +64,7 @@ URLs as credentials; avoid pasting them into public logs or issue reports.
 | `metadata_workers` | Concurrent metadata fetches, 1–6; default 3. Long series can have large episode lists. |
 | `stream_requests_per_minute` | Shared stream-check request budget across all workers, 1–600; default 30. Leave headroom for playback and other clients under AIOStreams' own limit. |
 | `check_delay_seconds` | Additional pause after each worker's check, 0–10 seconds; default 1.5. Lowering it does not bypass shared pacing. |
+| `recovery_snapshot` | Leave empty normally. Optional administrator-supplied snapshot for one-time recovery of still-valid confirmations; see recovery below. |
 | `scanner_instance_id` | This app's custom-preset `instanceId` in AIOStreams; default `cachedlibrary`. Used to identify and avoid its own resources. |
 
 ## Installation and switch-over
@@ -112,6 +113,24 @@ If previously truncated series still look unchanged, compare the app's per-title
 diagnostics with the source profile, allow time for checking, and confirm the
 AIOStreams and client metadata caches have refreshed.
 
+### Recovering confirmations invalidated by the 0.7.0 migration
+
+Version 0.7.2 can restore still-valid confirmations from a trusted pre-upgrade
+backup **only after verifying that its effective playback policy is unchanged**.
+This is an administrator repair, not a way to mark unchecked titles as available.
+The optional `recovery_snapshot` Home Assistant setting carries a base64url-encoded,
+zlib-compressed JSON object with `version: 1`, the current `policy_fingerprint`
+value in `policy`, and `checks` containing `type`, `id`, `parent`, `checked`,
+`expires`, `due`, and `count` copied from positive backup records. Never generate
+this snapshot from an unrelated profile or merely replace its policy hash.
+
+The importer repairs only pending records belonging to active titles. It retains
+original check times and expiry (shortening expiry if the configured positive
+lifetime is now lower), does not overwrite newer conclusive observations, and
+records the snapshot digest atomically to prevent replay. Check `/status`'s
+`recovery` result, then clear `recovery_snapshot`. No public write API is exposed.
+Normal restarts and 0.7.1-to-0.7.2 upgrades retain existing confirmations.
+
 ## Shelves, genres and search
 
 The source profile controls shelf names, order and candidate selection. Changes
@@ -136,11 +155,20 @@ of this version.
 
 The v0.7.0 policy fingerprint is intentionally broader. Its first synchronisation
 invalidates verdicts from earlier versions, so the visible library temporarily
-shrinks while confirmations are rebuilt. Later restarts do not repeat this reset.
+shrinks while confirmations are rebuilt. Version 0.7.2 supports the guarded
+backup recovery described above. Later restarts do not repeat this reset.
 Inherited or conditional playback profiles currently fail closed; use a directly
 saved playback profile until effective-policy resolution is supported.
 
 ## Availability, retries and pacing
+
+Movie and series work use separate queues and alternate when both have work.
+Unverified shows receive one probe per rotation to spread coverage across titles;
+verified or explicitly requested shows can use the configured episode batch.
+Still-valid confirmations due for renewal take priority over expanding the
+unchecked backlog. Expired confirmations rejoin ordinary scheduling. A large
+complete-episode index can still take days to cover within provider limits.
+
 
 - A movie needs a playable stream surviving the playback profile's filters. A
   series needs at least one confirmed aired episode; its published metadata

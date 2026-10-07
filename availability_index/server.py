@@ -10,6 +10,7 @@ import copy
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import secrets
@@ -17,6 +18,7 @@ import sqlite3
 import threading
 import time
 import unicodedata
+import zlib
 from collections import deque
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -417,6 +419,61 @@ class Store:
                   WHERE type=? AND id=? AND parent=?''', (verdict, now, now + ttl, now + ttl * .8, now, count, kind, ident, parent))
             self.db.commit()
 
+    def recover_confirmations(self, snapshot, policy, digest, now=None):
+        """Restore administrator-supplied evidence, never manufacture a new check.
+
+        Only a policy-matched backup can repair pending rows. A newer conclusive
+        result always wins; an error-only attempt must not erase earlier evidence.
+        The original confirmation time and expiry are preserved (or shortened).
+        """
+        now = time.time() if now is None else now
+        if not isinstance(snapshot, dict) or snapshot.get('version') != 1 or snapshot.get('policy') != policy:
+            raise ValueError('Recovery snapshot does not match the current playback policy')
+        records = snapshot.get('checks')
+        if not isinstance(records, list) or len(records)>100000:
+            raise ValueError('Invalid recovery snapshot record count')
+        valid = []
+        for item in records:
+            if not isinstance(item,dict) or item.get('type') not in ('movie','series'):
+                raise ValueError('Invalid recovery snapshot record')
+            if not all(isinstance(item.get(k),str) and 0<len(item[k])<=512 for k in ('id','parent')):
+                raise ValueError('Invalid recovery snapshot identifier')
+            for k in ('checked','expires','due'):
+                v=item.get(k)
+                if isinstance(v,bool) or not isinstance(v,(int,float)) or not math.isfinite(v):
+                    raise ValueError('Invalid recovery snapshot timestamp')
+            if not 0<item['checked']<=now or item['expires']<=item['checked'] or item['due']<item['checked']:
+                raise ValueError('Invalid recovery snapshot confirmation interval')
+            if isinstance(item.get('count'),bool) or not isinstance(item.get('count'),int) or item['count']<1:
+                raise ValueError('Invalid recovery snapshot stream count')
+            expiry=min(item['expires'],item['checked']+self.positive)
+            if expiry>now+60:
+                valid.append((item,expiry))
+        with self.lock:
+            applied=self.setting('applied_recovery_snapshots') or []
+            if digest in applied:
+                return {'restored':0,'already_applied':True}
+            restored=0
+            try:
+                for item,expiry in valid:
+                    cur=self.db.execute('''UPDATE checks SET status='available',checked=?,expires=?,count=?,
+                      due=CASE WHEN failures>0 THEN MAX(due,?) ELSE ? END
+                      WHERE type=? AND id=? AND parent=? AND status='pending' AND checked<=?
+                      AND EXISTS(SELECT 1 FROM membership m JOIN categories c ON c.id=m.category
+                        WHERE m.type=checks.type AND m.id=checks.parent AND c.active=1)''',
+                      (item['checked'],expiry,item['count'],min(item['due'],expiry-60),min(item['due'],expiry-60),
+                       item['type'],item['id'],item['parent'],item['checked']))
+                    restored+=cur.rowcount
+                applied.append(digest)
+                self.db.execute("INSERT OR REPLACE INTO settings VALUES ('applied_recovery_snapshots',?)",(encode(applied),))
+                result={'restored':restored,'fresh_snapshot_records':len(valid),'applied_at':now}
+                self.db.execute("INSERT OR REPLACE INTO settings VALUES ('last_recovery',?)",(encode(result),))
+                self.db.commit()
+                return result
+            except Exception:
+                self.db.rollback()
+                raise
+
     def visible(self, kind, ident, now):
         return self.db.execute('''SELECT 1 FROM checks c WHERE type=? AND parent=? AND status='available' AND expires>?
           AND EXISTS (SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category
@@ -567,7 +624,7 @@ class App:
         self.provider_errors_visible = False
         self.policy_lock = threading.RLock()
         self.inflight = set()
-        self.check_queue = deque()
+        self.check_queue = {}
         self.stop = threading.Event()
         self.heartbeats = {}
         self.threads = {}
@@ -714,6 +771,23 @@ class App:
                 self.store.setting('policy', fingerprint)
                 with self.store.lock:
                     self.check_queue.clear()
+            recovery=self.o.get('recovery_snapshot')
+            if recovery:
+                digest=hashlib.sha256(recovery.encode()).hexdigest()
+                if digest not in (self.store.setting('applied_recovery_snapshots') or []):
+                    if len(recovery)>4*1024*1024:
+                        raise ValueError('Recovery snapshot exceeds the size limit')
+                    try:
+                        compressed=base64.b64decode(recovery,altchars=b'-_',validate=True)
+                        decoder=zlib.decompressobj()
+                        raw=decoder.decompress(compressed,16*1024*1024+1)
+                        if not decoder.eof or decoder.unused_data or len(raw)>16*1024*1024:
+                            raise ValueError('Recovery snapshot exceeds the decoded size limit')
+                        snapshot=json.loads(raw)
+                    except Exception:
+                        raise ValueError('Invalid encoded recovery snapshot') from None
+                    result=self.store.recover_confirmations(snapshot,fingerprint,digest)
+                    print('Recovered '+str(result['restored'])+' still-valid confirmations',flush=True)
             self.ready, self.error = True, None
             self.store.setting('last_sync', time.time())
 
@@ -827,44 +901,64 @@ class App:
     def next_check(self, preferred):
         with self.store.lock:
             now = time.time()
-            # Indexed urgent renewals, independent of the size of the episode backlog.
+            # Renew still-visible confirmations first. Expired evidence no longer
+            # protects a visible title and must share the ordinary scan budget;
+            # otherwise error-only retries could monopolise this priority forever.
             rows = self.store.db.execute('''SELECT c.* FROM checks c
-              WHERE c.status='available' AND c.due<? AND EXISTS
+              WHERE c.status='available' AND c.due<? AND c.expires>? AND EXISTS
               (SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category
                WHERE m.type=c.type AND m.id=c.parent AND cat.active=1)
-              ORDER BY c.due LIMIT 100''', (now,)).fetchall()
+              ORDER BY c.due LIMIT 100''', (now, now + 60)).fetchall()
             for row in rows:
                 key = (row['type'], row['id'], row['parent'])
                 if key not in self.inflight:
                     self.inflight.add(key)
                     return row
-            while True:
-                while self.check_queue:
-                    queued = self.check_queue.popleft()
+            # Each kind owns its pending batch. A series batch must never consume
+            # a worker's movie turn (or vice versa) while both have work available.
+            for kind in (preferred, 'series' if preferred == 'movie' else 'movie'):
+                queue = self.check_queue.setdefault(kind, deque())
+                while queue:
+                    queued = queue.popleft()
                     row = self.store.db.execute('''SELECT c.* FROM checks c WHERE c.type=? AND c.id=? AND c.parent=?
                       AND c.due<? AND EXISTS(SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category
                       WHERE m.type=c.type AND m.id=c.parent AND cat.active=1)''', (*queued, now)).fetchone()
                     if row is not None and queued not in self.inflight:
                         self.inflight.add(queued)
                         return row
-                title = self.store.db.execute('''SELECT t.type,t.id FROM titles t
-                  WHERE EXISTS(SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category
+                # Fetch more than one parent so a slow in-flight request cannot
+                # make this kind appear idle while another title is ready.
+                titles = self.store.db.execute('''SELECT t.type,t.id,t.scan_touched,
+                  EXISTS(SELECT 1 FROM checks c WHERE c.type=t.type AND c.parent=t.id
+                    AND c.status='available' AND c.expires>?) AS verified
+                  FROM titles t WHERE t.type=? AND EXISTS
+                  (SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category
                     WHERE m.type=t.type AND m.id=t.id AND cat.active=1)
                   AND EXISTS(SELECT 1 FROM checks c WHERE c.type=t.type AND c.parent=t.id AND c.due<?)
-                  ORDER BY (t.type!=?),(t.scan_touched>0),t.scan_touched,t.priority,t.rank,t.id LIMIT 1''',
-                  (now, preferred)).fetchone()
-                if title is None:
-                    return None
-                rows = self.store.db.execute('''SELECT type,id,parent FROM checks WHERE type=? AND parent=? AND due<?
-                  ORDER BY (attempted>0),priority,due,id LIMIT ?''',
-                  (title['type'], title['id'], now, self.o.get('max_episodes_per_series', 12))).fetchall()
-                self.store.db.execute('UPDATE titles SET scan_touched=? WHERE type=? AND id=?', (now, title['type'], title['id']))
-                self.store.db.commit()
-                self.check_queue.extend((r['type'],r['id'],r['parent']) for r in rows
-                                        if (r['type'],r['id'],r['parent']) not in self.inflight)
-                if not self.check_queue:
-                    # All currently eligible work for this parent is already in flight.
-                    return None
+                  ORDER BY (t.scan_touched>0),t.scan_touched,t.priority,t.rank,t.id LIMIT ?''',
+                  (now + 60, kind, now, max(16, len(self.inflight) + 1))).fetchall()
+                # During the first pass spend one request on each show before
+                # expanding an already visible show's episode list. A client
+                # request (negative scan_touched) deliberately bypasses this.
+                initial_pass = any(t['scan_touched'] == 0 for t in titles)
+                for title in titles:
+                    requested = title['scan_touched'] < 0
+                    batch = self.o.get('max_episodes_per_series', 12)
+                    if kind == 'movie' or (not requested and (initial_pass or not title['verified'])):
+                        batch = 1
+                    rows = self.store.db.execute('''SELECT * FROM checks WHERE type=? AND parent=? AND due<?
+                      ORDER BY (attempted>0),priority,due,id LIMIT ?''',
+                      (kind, title['id'], now, batch + len(self.inflight))).fetchall()
+                    rows = [r for r in rows if (r['type'],r['id'],r['parent']) not in self.inflight][:batch]
+                    if not rows:
+                        continue
+                    self.store.db.execute('UPDATE titles SET scan_touched=? WHERE type=? AND id=?', (now, kind, title['id']))
+                    self.store.db.commit()
+                    queue.extend((r['type'],r['id'],r['parent']) for r in rows[1:])
+                    row = rows[0]
+                    self.inflight.add((row['type'],row['id'],row['parent']))
+                    return row
+            return None
 
     def worker(self, number):
         turn = number
@@ -908,7 +1002,7 @@ class App:
         for kind in ('movie', 'series'):
             catalogs.append({'id': 'cached-search', 'type': kind, 'name': 'Available ' + kind + ' search',
                              'extra': [{'name': 'search', 'isRequired': True}, {'name': 'skip', 'isRequired': False}]})
-        return {'id': 'local.cached.media.library', 'version': '0.7.1', 'name': 'Cached Media Library',
+        return {'id': 'local.cached.media.library', 'version': '0.7.2', 'name': 'Cached Media Library',
                 'description': 'Recently verified cached streams matching your AIOStreams filters. Metadata only.',
                 'types': ['movie', 'series'],
                 'resources': ['catalog', {'name': 'meta', 'types': ['movie', 'series'], 'idPrefixes': ['tt', 'tmdb:']}],
@@ -965,6 +1059,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path in ('/', '/health', '/status'):
             status = {'ready': app.ready, 'issue': app.error, 'last_policy_sync': app.store.setting('last_sync'),
+                      'recovery': app.store.setting('last_recovery'),
                       'worker_errors': app.worker_errors,
                       'workers_alive': {k: v.is_alive() for k,v in app.threads.items()},
                       'worker_ages': {k: round(time.time() - v) for k, v in app.heartbeats.items()}, **app.store.status()}
