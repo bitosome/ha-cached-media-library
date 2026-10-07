@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.7.0
+
+- Require a separate source profile for upstream catalogues and complete metadata.
+  This prevents client-facing filtered episode lists feeding back into scanning and
+  makes fresh installations independent of previously learned catalogue rows.
+- Re-fetch original series metadata once on upgrade. The new policy fingerprint
+  revalidates old verdicts on the first synchronisation; shelves refill progressively.
+  Treat `max_episodes_per_series` as a progressive batch size, keeping all aired
+  candidates eligible instead of permanently restricting a show to a few episodes.
+- Preserve good series metadata after incomplete responses and keep episode pruning
+  scoped to its parent title. Retain translated search names during catalogue
+  refreshes and refresh shelves when they are re-enabled.
+- Treat unexplained empty stream responses as unknown and retry them; only explicit
+  negatives use `negative_hours`. Broaden policy-change detection to settings that
+  affect which streams are acceptable.
+- Add `stream_requests_per_minute` (default 30) for shared stream request pacing,
+  with a shared cooldown when AIOStreams reports rate limiting or unavailability.
+- Publish source genre information and consolidate known title aliases where the
+  metadata identifies the same work.
+- Correct setup and upgrade documentation: configure the separate source profile
+  before switch-over, shorten AIOStreams cache lifetimes for this app's resources,
+  and distinguish recent availability confirmation from a playback guarantee.
+- Continue reading AIOStreams without modifying profile or administrator settings;
+  no dashboard administrator credentials or video proxy are required.
+
 ## 0.6.6
 
 - Key availability checks by `(title, episode)` instead of `(title, episode id)`.
@@ -115,8 +140,6 @@
 - Read-only redesign. The app no longer writes AIOStreams configuration and no
   longer needs dashboard or administrator credentials; it indexes through the
   public Stremio endpoint and mirrors the profile's own filters.
-- Learned catalogues are never dropped, so indexing continues after upstream
-  catalogues are hidden at switch-over.
 - Filter-relevant profile changes invalidate stored verdicts; sort and label
   preferences do not.
 - Cap episode checks per series and prioritise the newest seasons' openers.

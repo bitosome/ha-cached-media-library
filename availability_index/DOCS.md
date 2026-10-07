@@ -1,155 +1,195 @@
 # Cached Media Library
 
-Publishes catalogues and search results containing only titles whose stream was
-recently verified as playable under your AIOStreams profile's own filters.
+Publishes discovery shelves, search results and series episodes with recently
+confirmed cached streams under your AIOStreams playback profile's filters. It
+never proxies video, stores stream URLs, or writes AIOStreams configuration.
 
-The app never proxies video, never stores stream URLs, and never writes to your
-AIOStreams configuration.
+A confirmation is a recent observation, not a playback guarantee. A provider may
+remove a cached file or become unavailable afterward. Keep cached-only filtering
+enforced in the playback profile so a stale library entry cannot enable downloading
+an uncached stream.
+
+## Profiles: configure these before switch-over
+
+Two separate AIOStreams profiles are required:
+
+- **Playback profile:** the profile used by Infuse or another Jellyfin client.
+  Its settings determine acceptable streams. The app reads its configuration with
+  `active_uuid` and `active_password`, and checks streams through its
+  `stremio_uuid` and `stremio_encrypted_password` endpoint. These must refer to the
+  same playback profile.
+- **Source profile:** keeps the original upstream catalogue and metadata providers
+  enabled. Use its `catalog_uuid` and `catalog_encrypted_password` here. Its UUID
+  must differ from the playback profile. Do not add Cached Media Library to this
+  profile or hide its upstream catalogues.
+
+The source profile supplies complete candidate lists and episode metadata. Reading
+metadata back from the filtered playback profile would progressively restrict the
+scanner to the episodes it had already published. The app rejects incomplete or
+unsafe source configuration instead of relying on an old database to bootstrap.
+
+Only the playback profile's ordinary configuration password is needed. Do not enter
+AIOStreams dashboard administrator credentials. The app does not change either
+profile or modify the dashboard's error-display settings.
+
+### Finding the Stremio credentials
+
+A saved profile has an endpoint of the form:
+
+```text
+http://HOST:3000/stremio/<uuid>/<encrypted_password>/manifest.json
+```
+
+Copy the two segments from each profile's configuration page. The encrypted
+password is different from the password used to open that profile. Treat these
+URLs as credentials; avoid pasting them into public logs or issue reports.
 
 ## Configuration
 
 | Option | Description |
 | --- | --- |
-| `aiostreams_url` | Base URL of the AIOStreams instance, for example `http://192.168.0.13:3000`. |
-| `active_uuid` | UUID of the AIOStreams profile to mirror. Used read-only to verify the cache filter. |
-| `active_password` | Password of that profile. |
-| `stremio_uuid` | UUID used in the profile's Stremio endpoint. Usually the same as `active_uuid`. |
-| `stremio_encrypted_password` | The profile's encrypted password, the last segment of its Stremio URL. |
-| `catalog_uuid` | Optional. UUID of the profile whose catalogues are indexed. Defaults to `stremio_uuid`. |
-| `catalog_encrypted_password` | Optional. Encrypted password of that profile. |
-| `endpoint_token` | Private token protecting this app's Stremio endpoint. Generated and remembered when left empty. |
-| `positive_hours` | How long a confirmed cached stream stays published (1–48). |
-| `negative_hours` | How long a negative result is trusted before rechecking (1–168). |
-| `max_candidates_per_category` | How deep each catalogue is indexed (20–5000). |
-| `max_episodes_per_series` | Episode checks queued per show (1–100), newest seasons first. |
-| `metadata_workers` | Concurrent episode-list fetches (1–6). Episode lists for long-running shows are large. |
-| `check_delay_seconds` | Pause each check worker takes between checks (0–10). |
-| `workers` | Concurrent availability checks (1–6). |
-| `scanner_instance_id` | AIOStreams `instanceId` of this app's preset. Used to avoid indexing itself. |
+| `aiostreams_url` | AIOStreams base URL, for example `http://192.168.0.13:3000`. |
+| `active_uuid` | Playback profile UUID, used read-only to verify its filters. |
+| `active_password` | Playback profile configuration password, not dashboard administrator password. |
+| `stremio_uuid` | Playback profile's Stremio UUID; must match `active_uuid`. |
+| `stremio_encrypted_password` | Playback profile's encrypted Stremio password. |
+| `catalog_uuid` | Required separate source profile UUID, distinct from the playback profile. |
+| `catalog_encrypted_password` | Required source profile's encrypted Stremio password. |
+| `endpoint_token` | Private token protecting this app's metadata endpoint. Generated and remembered if empty; an explicitly set token must contain at least 24 characters. |
+| `positive_hours` | Confirmation lifetime, 1–48 hours; default 12. Shorter lifetimes improve freshness but need more rechecks. |
+| `negative_hours` | Lifetime of a confirmed negative result, 1–168 hours; default 24. This does not apply to provider errors or unexplained empty responses. |
+| `max_candidates_per_category` | Upstream candidate depth per shelf, 20–5000; default 250. It is not a target number of verified results. |
+| `max_episodes_per_series` | Progressive episode batch size, 1–100; default 12. All aired candidates remain eligible; this does not permanently cap visible episodes. |
+| `workers` | Concurrent availability workers, 1–6; default 2. They share the rate budget below. |
+| `metadata_workers` | Concurrent metadata fetches, 1–6; default 3. Long series can have large episode lists. |
+| `stream_requests_per_minute` | Shared stream-check request budget across all workers, 1–600; default 30. Leave headroom for playback and other clients under AIOStreams' own limit. |
+| `check_delay_seconds` | Additional pause after each worker's check, 0–10 seconds; default 1.5. Lowering it does not bypass shared pacing. |
+| `scanner_instance_id` | This app's custom-preset `instanceId` in AIOStreams; default `cachedlibrary`. Used to identify and avoid its own resources. |
 
-### Finding the Stremio credentials
+## Installation and switch-over
 
-AIOStreams exposes each saved configuration at
-`http://HOST:3000/stremio/<stremio_uuid>/<stremio_encrypted_password>/manifest.json`.
-Both values are on the configuration page; `stremio_uuid` is normally the same
-UUID as `active_uuid`.
+1. Back up the existing AIOStreams configuration. Create the separate source profile
+   described above and verify that its original catalogue and metadata providers
+   work before hiding anything in the playback profile.
+2. In the playback profile, enable `excludeUncached` and the required expression
+   `cached(service(streams, 'torbox'))`. Keep the intended quality and language
+   filters enabled. Configure both profiles' credentials in this app and start it.
+3. Open the app's Home Assistant panel or `http://HOST:8097/status`. Wait for `ready`
+   to become `true` and for useful titles to be verified. Initial coverage grows
+   progressively and can take hours.
+4. Add the app to the **playback profile only** as a custom add-on, using the
+   `instanceId` configured above and the manifest URL shown in the app's startup
+   log: `http://HOST:8097/<endpoint_token>/manifest.json`. Enable `catalog` and
+   `meta` resources. Keep the playback profile's stream providers enabled.
+5. Disable the original discovery and search catalogues in the playback profile so
+   they cannot bypass the filtered library. Ensure the app's metadata is used for
+   client-facing series lists. Leave the source profile unchanged.
+6. Set short AIOStreams cache lifetimes for this app's resources: **30 seconds for
+   catalogue and metadata responses, 60 seconds for its manifest**. Verify the
+   effective AIOStreams cache settings; HTTP headers or Stremio hints alone may not
+   override AIOStreams' configured cache. Longer caching can keep expired entries
+   or old shelf definitions in clients after the index changes.
+7. Set `jellyfin.maxLibraries` high enough for all shelves, then refresh the library
+   in Infuse. Check both browsing and search, including a series' episode list.
 
-## Switch-over
+Rollback: remove or disable the custom add-on in the playback profile and restore
+its original catalogue and metadata settings. The source profile and stored index
+are unchanged by that operation.
 
-The app publishes its own catalogues. Clients keep using your AIOStreams
-Jellyfin-compatible endpoint; only the catalogue source changes.
+## Upgrading to 0.7.0
 
-1. Start the app and open its diagnostics at `http://HOST:8097/status`. Wait until
-   `ready` is `true` and at least a few titles are verified.
-2. In AIOStreams add a **custom** add-on with
-   `instanceId` `cachedlibrary` (matching `scanner_instance_id`) and manifest URL
-   `http://HOST:8097/<endpoint_token>/manifest.json`, with resources
-   `catalog` and `meta`.
-3. Disable the upstream catalogues in the profile's catalogue settings so they do
-   not appear alongside the filtered copies. Disabled catalogues remain fetchable
-   through the Stremio endpoint, so indexing continues.
+Take a Home Assistant app backup first. Existing installations now need a distinct
+source profile with working catalogue and metadata providers; configure its two
+credentials before switching over or restarting the upgraded app.
 
-Rollback: remove the custom add-on and re-enable the upstream catalogues. Nothing
-in the app is one-way.
+The upgrade schedules series metadata to be fetched again from that source,
+recovering full episode lists. The expanded policy fingerprint revalidates old
+verdicts during the first synchronisation. Shelves refill progressively, and later
+restarts retain confirmations until normal expiry or another policy change.
+Additional aired episodes are checked rather than permanently excluded by a cap.
 
-## Why disabling upstream catalogues does not stop indexing
+If previously truncated series still look unchanged, compare the app's per-title
+diagnostics with the source profile, allow time for checking, and confirm the
+AIOStreams and client metadata caches have refreshed.
 
-AIOStreams hides disabled catalogues from clients and from client search, but its
-Stremio endpoint still serves them by id. The app also remembers the catalogue list
-in its database, so it keeps verifying new additions after the switch-over.
+## Shelves, genres and search
 
-### Revising the shelves
+The source profile controls shelf names, order and candidate selection. Changes
+are reconciled during synchronisation. Removed shelves are retired; re-enabled
+shelves are crawled again. A completely empty upstream shelf is not published once
+its crawl finishes. A shelf with candidates but no confirmed results may be empty
+while checks are pending or when none of its candidates qualify.
 
-Shelves come from the catalogue source profile, so that is the only place to edit
-them. Add, remove, rename or reorder catalogues there and the app reconciles on its
-next synchronisation: new shelves are crawled, removed shelves are retired along
-with their titles and checks, and client order follows that profile's order.
+Genre options are published where source data supplies genres. Titles without
+genre metadata cannot be assigned reliably. Known IMDb/TMDB aliases are combined
+where metadata establishes that they identify the same title; translated names
+remain searchable across catalogue refreshes.
 
-AIOStreams truncates the list to `jellyfin.maxLibraries` (default 24), silently
-dropping the last shelves. Raise it above the number of shelves you publish.
+**Search covers indexed candidates only.** A cached title outside those catalogues
+or their configured depth will not appear. Raising catalogue depth improves
+coverage at the cost of more checking. On-demand upstream discovery is not part
+of this version.
 
-### Reinstalling or starting fresh
+The v0.7.0 policy fingerprint is intentionally broader. Its first synchronisation
+invalidates verdicts from earlier versions, so the visible library temporarily
+shrinks while confirmations are rebuilt. Later restarts do not repeat this reset.
+Inherited or conditional playback profiles currently fail closed; use a directly
+saved playback profile until effective-policy resolution is supported.
 
-The app needs to learn which catalogues to index. After switch-over the family
-catalogue list is served by this app itself, so the family manifest no longer
-contains the upstream definitions. To stay reinstall-proof, point
-`catalog_uuid`/`catalog_encrypted_password` at a profile that still has the upstream
-catalogues enabled and is never switched over. A fresh install then bootstraps from
-that profile instead of depending on data it no longer has. If those options are
-empty the app falls back to the active profile's own manifest.
+## Availability, retries and pacing
 
-A catalogue that finishes crawling with no titles at all is not published, so a
-stale definition cannot leave a permanently empty shelf.
+- A movie needs a playable stream surviving the playback profile's filters. A
+  series needs at least one confirmed aired episode; its published metadata
+  contains only its confirmed episodes.
+- A successful confirmation expires after `positive_hours`, with a refresh
+  scheduled before expiry. Failed refreshes do not extend the confirmation.
+- An explicit negative result is retained for `negative_hours` (24 by default).
+  Provider timeouts, rate limits and unexplained empty responses remain unknown
+  and are retried with backoff. They neither prove absence nor publish a title.
+  When the playback profile hides provider errors, all no-stream results remain
+  unknown: even a filtering notice could conceal another provider's failure.
+- Acceptance-policy changes invalidate old results. Do not expect prior
+  confirmations to survive stricter quality, language or source filters.
+- All stream workers share `stream_requests_per_minute` and an upstream cooldown.
+  Configure this below the effective AIOStreams limit, accounting for other users.
+  More workers can overlap slow requests but do not increase the shared budget.
+- The source and playback profiles may cache their own upstream responses. The
+  observation's freshness therefore also depends on those provider caches.
 
-## Operating notes
+Runtime state lives in `/data/availability.sqlite` and is included in Home
+Assistant app backups. No stream URLs or video files are stored by this app.
 
-- **Indexing is progressive.** Sections fill as titles are verified; nothing waits
-  for a complete crawl. A full first pass over the default depth takes hours.
-- **Search covers what is indexed.** A cached title that has not been indexed yet
-  will not appear in search. Raise `max_candidates_per_category` for broader cover.
-- **Rate limits.** AIOStreams' `stremioStream` limiter defaults to 10 requests per
-  15 seconds per IP. The default two workers stay under it and sustain roughly
-  0.4–0.5 checks per second. Raising `workers` past 2 can trigger HTTP 429; the app
-  backs off and retries rather than recording a false negative.
-- **Series cost more than films.** Each show queues up to
-  `max_episodes_per_series` checks, prioritising each newest season's opener.
-- **Runtime state** is stored in the app's `/data` volume
-  (`availability.sqlite`) and is included in Home Assistant backups.
-
-## Monitoring
+## Monitoring and troubleshooting
 
 | Endpoint | Purpose |
 | --- | --- |
-| `/health` | `200` when ready and all workers are recent; `503` otherwise. Used by the image's `HEALTHCHECK`. |
-| `/status` | Readiness, issue text, per-category verified/candidate counts, backlog and worker ages. |
+| `/health` | HTTP 200 when ready and worker heartbeats are recent; HTTP 503 otherwise. Used by Docker's health check. |
+| `/status` | Readiness, issue text, category counts, backlog and worker ages. Also shown by the Home Assistant panel. |
+| `/status?lookup=series:tt123` | Per-title metadata and availability diagnostics; replace the identifier with the title being investigated. Use `movie:` for films. |
 
-Both are unauthenticated and deliberately expose no credentials, URLs or tokens.
+These diagnostics are unauthenticated and contain no credentials or stream URLs.
+Keep port 8097 on your trusted network. The Stremio endpoint itself requires the
+private token. The startup log contains its URL, so redact it before sharing logs.
 
-## Troubleshooting
+**Not ready after installation or upgrade:** read `issue` in `/status`. Check both
+profiles' credentials, confirm they are distinct, and ensure the source profile
+has upstream catalogues and metadata enabled. It must not include this app.
 
-**`ready` is false with `AIOStreams is not excluding uncached streams` or
-`AIOStreams is not requiring a cached TorBox stream`.** The mirrored profile no
-longer enforces cached-only playback. Fix the profile; the app resumes publishing
-automatically.
+**Cached-only policy rejected:** restore both `excludeUncached` and the required
+cached TorBox expression in the playback profile. The app resumes after successful
+synchronisation; it does not repair the profile itself.
 
-**`ready` is false with `aiostreams_url must be an http(s) URL`, `active_uuid and
-active_password are required`, `stremio_uuid and stremio_encrypted_password are
-required`, or `endpoint_token must be at least 24 characters when set`.** The app is
-running but not indexed because its options are incomplete. Open the app
-configuration, fill in the reported values, and restart. Nothing is lost: the app
-reports the problem instead of crash-looping, and `/status` repeats it.
+**Missing title or episode:** check `/status?lookup=...`, then compare the source
+metadata and playback profile's stream response. A title may be outside indexed
+coverage, pending a check, unknown after a provider failure, or confirmed absent.
+Do not assume an empty search result proves the debrid provider has no cached copy.
 
-**`ready` is false with `no upstream catalogues found in the profile manifest`.**
-The catalogue source profile has no browsable catalogues. Check
-`catalog_uuid`/`catalog_encrypted_password`, or re-enable at least one catalogue in
-the profile the app reads.
+**Russian search stopped finding a title:** verify that either its catalogue
+preview or metadata actually contains the Russian name. Search preserves names
+that source data provides; it cannot invent missing translations.
 
-**`Synchronisation failed (HTTPError ...)`.** Check `aiostreams_url`, the profile
-UUID/password pair and the Stremio credentials. A `404` usually means a wrong
-`stremio_uuid` or encrypted password; `401` means a wrong profile password.
-
-**Shelves look nearly empty straight after install.** The index verifies one
-candidate at a time, so coverage grows for hours. `/status` shows how far it has
-got: `verified_now` against `pending` plus `metadata_pending`. Nothing is being
-wrongly dropped — check a title directly against the profile's `/stream` endpoint
-to confirm the app agrees with AIOStreams. Series fill in last, because their
-episode checks only exist once the (sometimes very large) episode list has been
-fetched; `metadata_workers` and `check_delay_seconds` are the throughput levers.
-
-**Sections are empty.** Nothing has been verified yet, or every candidate really
-is uncached. Compare `/status` counts with the same title checked directly in
-AIOStreams. A title with only uncached sources is working as intended: it is
-hidden until a cached copy appears.
-
-**A title is missing from search.** It has not been indexed yet, or it has no
-cached stream. Verify it directly against the profile's `/stream` endpoint.
-
-**The app reports unhealthy.** `/health` answers `503` until the profile has been
-read successfully and all workers are recent, so a freshly started app is briefly
-unhealthy by design. If it stays unhealthy, check the log for a synchronisation
-failure and confirm the AIOStreams options.
-
-**Do not add a `watchdog` key to `config.yaml`.** The Supervisor `watchdog` option
-is obsolete; the Home Assistant add-on linter rejects it, and a boolean value makes
-the Supervisor drop the app from the store. Container health is reported by the
-image `HEALTHCHECK`, which polls `/health`.
+**Unhealthy app:** inspect the reported issue and worker ages. Docker's health
+check reports failure but does not itself restart a dead worker. If a worker stays
+stale, retain sanitized diagnostic information and restart the app through Home
+Assistant; investigate recurring failures rather than relying on health status
+alone.

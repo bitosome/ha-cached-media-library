@@ -17,24 +17,29 @@ import sqlite3
 import threading
 import time
 import unicodedata
+from collections import deque
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 from urllib.request import Request, urlopen
 
-# Settings that decide whether a stream counts as playable. A change to any of
-# them invalidates stored verdicts; preferences such as sort order do not.
-POLICY_KEYS = (
-    'excludeUncached',
-    'requiredStreamExpressions',
-    'excludedQualities',
-    'excludedVisualTags',
-    'services',
-    'titleMatching',
-    'seasonEpisodeMatching',
-    'checkOwned',
-)
+# Include new/unknown settings conservatively. An allow-list of a few filters
+# missed language, resolution, size and provider changes and kept stale verdicts.
+# Only known presentation, identity and catalogue-only settings are excluded.
+NON_POLICY_KEYS = frozenset({
+    'uuid', 'encryptedPassword', 'accessKey', 'ip', 'showChanges',
+    'manifestNotice', 'linkedAccounts', 'appliedTemplates',
+    'addonName', 'addonLogo', 'addonBackground', 'addonDescription',
+    'addonCategoryColors', 'formatter', 'sortCriteria', 'statistics',
+    'hideErrors', 'hideErrorsForResources', 'catalogModifications',
+    'newCatalogsDisabled', 'upstreamCatalogOrder', 'mergedCatalogs',
+    'jellyfin', 'rpdbApiKey', 'topPosterApiKey', 'aioratingsApiKey',
+    'aioratingsProfileId', 'openposterdbApiKey', 'openposterdbUrl',
+    'openposterdbParameters', 'posterService', 'usePosterRedirectApi',
+    'usePosterServiceForMeta',
+})
 STRICT_FILTER = "cached(service(streams, 'torbox'))"
 
 
@@ -47,21 +52,57 @@ def folded(value):
 
 
 def playable(stream):
-    # Information cards, error cards, magnets and P2P hashes are not playable.
-    return isinstance(stream, dict) and urlsplit(stream.get('url') or '').scheme in ('http', 'https')
+    # AIOStreams can give information videos HTTP URLs, so a URL alone is not
+    # enough. Its structured streamData identifies these independently of labels.
+    if not isinstance(stream, dict) or stream.get('error'):
+        return False
+    data = stream.get('streamData') or {}
+    if not isinstance(data, dict) or data.get('error'):
+        return False
+    if (data.get('type') or stream.get('type')) in ('info', 'info-basic', 'error', 'statistic', 'external', 'p2p', 'youtube'):
+        return False
+    if any(str(value).startswith(('aiostreamserror.', 'error.'))
+           for value in (stream.get('id', ''), data.get('id', ''))):
+        return False
+    service = data.get('service')
+    if isinstance(service, dict) and service.get('cached') is False:
+        return False
+    url = stream.get('url')
+    if not isinstance(url, str):
+        return False
+    try:
+        parsed = urlsplit(url)
+        return (parsed.scheme in ('http', 'https') and bool(parsed.netloc)
+                and 'aiostreamserror.' not in unquote(parsed.path))
+    except ValueError:
+        return False
 
 
 def stream_verdict(result):
+    if not isinstance(result, dict):
+        return 'error', 0
     streams = result.get('streams')
     if not isinstance(streams, list):
         return 'error', 0
     count = sum(playable(s) for s in streams)
     if count:
         return 'available', count
-    notices = ' '.join(str(s.get('description', '')) + ' ' + str(s.get('name', '')) for s in streams)
-    if result.get('error') or re.search(r'timeout|timed out|rate.?limit|unavailable|failed|error|429', notices, re.I):
+    cards = [s for s in streams if isinstance(s, dict)]
+    notices = ' '.join(str(s.get('description', '')) + ' ' + str(s.get('name', '')) for s in cards)
+    structured_error = any(s.get('error') or (isinstance(s.get('streamData'), dict)
+                           and (s['streamData'].get('error') or s['streamData'].get('type') == 'error'))
+                           for s in cards)
+    if (result.get('error') or result.get('errors') or structured_error
+            or re.search(r'timeout|timed out|rate.?limit|unavailable|failed|error|429', notices, re.I)):
         return 'error', 0
-    return 'unavailable', 0
+    # hideErrors in the family profile can turn provider failures into streams:[].
+    # Only an explicit filtering report proves absence; ambiguous empty responses
+    # must retry without replacing or extending an earlier positive confirmation.
+    filtered = any('removal reasons' in str(s.get('name', '')).casefold()
+                   and re.search(r'\b(?:excluded|required|included|filtered)\b[^\n]*\([1-9]\d*\)',
+                                 str(s.get('description', '')), re.I)
+                   for s in cards)
+    return ('unavailable' if filtered else 'error'), 0
 
 
 def aired(video, now):
@@ -84,7 +125,40 @@ def episode_order(video):
 
 
 def policy_fingerprint(config):
-    return hashlib.sha256(encode({k: config.get(k) for k in POLICY_KEYS}).encode()).hexdigest()
+    policy = {k: copy.deepcopy(v) for k, v in config.items() if k not in NON_POLICY_KEYS}
+    presets = []
+    for preset in policy.pop('presets', []) or []:
+        if not isinstance(preset, dict):
+            presets.append(preset)  # Malformed/unknown settings still change policy.
+            continue
+        if preset.get('enabled') is False:
+            continue
+        options = preset.get('options') or {}
+        resources = options.get('resources') if isinstance(options, dict) else None
+        if isinstance(resources, list) and resources:
+            names = [r.get('name') if isinstance(r, dict) else r for r in resources]
+            if all(name in ('catalog', 'meta', 'subtitles', 'addon_catalog', 'watch_state') for name in names):
+                continue
+        item = {k: v for k, v in preset.items() if k != 'category'}
+        if isinstance(resources, list) and 'stream' in [r.get('name') if isinstance(r, dict) else r for r in resources]:
+            # Toggling catalogue or metadata output on a stream provider doesn't
+            # change the stream policy, but retain stream-specific resource data.
+            item['options']['resources'] = [r for r in resources if (r.get('name') if isinstance(r, dict) else r) == 'stream']
+        presets.append(item)
+    if presets:
+        policy['presets'] = presets
+    for key in ('variants', 'healthChecks'):
+        if isinstance(policy.get(key), list):
+            policy[key] = [{k: v for k, v in item.items() if k != 'name'} if isinstance(item, dict) else item
+                           for item in policy[key]]
+    parent = policy.get('parentConfig')
+    if isinstance(parent, dict) and isinstance(parent.get('mergeStrategies'), dict):
+        strategies = parent['mergeStrategies']
+        for key in ('sorting', 'formatter', 'branding'):
+            strategies.pop(key, None)
+        if isinstance(strategies.get('fieldOverrides'), dict):
+            strategies['fieldOverrides'] = {k: v for k, v in strategies['fieldOverrides'].items() if k not in NON_POLICY_KEYS}
+    return hashlib.sha256(encode(policy).encode()).hexdigest()
 
 
 def is_scanner_catalog(catalog_id, instance_id):
@@ -118,7 +192,7 @@ class Store:
     def migrate(self):
         """Add columns introduced after a database was first created."""
         wanted = {'titles': [('priority', 'INTEGER DEFAULT 9999'), ('rank', 'INTEGER DEFAULT 999999'),
-                             ('meta_claimed', 'REAL DEFAULT 0')],
+                             ('meta_claimed', 'REAL DEFAULT 0'), ('scan_touched', 'REAL DEFAULT 0')],
                   'categories': [('active', 'INTEGER DEFAULT 1')]}
         added = set()
         for table, columns in wanted.items():
@@ -153,6 +227,37 @@ class Store:
         # which older versions could cache for a day (see the empty-list guard).
         self.db.execute('''UPDATE titles SET meta_due=0,meta_checked=0 WHERE type='series' AND meta_checked>0
           AND NOT EXISTS (SELECT 1 FROM checks c WHERE c.type='series' AND c.parent=titles.id)''')
+        self.db.execute('CREATE INDEX IF NOT EXISTS checks_parent_due ON checks(type,parent,due,priority)')
+        self.db.execute('CREATE INDEX IF NOT EXISTS checks_due_status ON checks(status,due)')
+        version = self.db.execute("SELECT value FROM settings WHERE key='store_schema_version'").fetchone()
+        if version is None or int(json.loads(version[0])) < 2:
+            # Earlier releases fetched the published (filtered) episode list and
+            # permanently truncated candidate checks. Fetch original metadata once
+            # after upgrading, retaining all availability confirmations meanwhile.
+            self.db.execute("UPDATE titles SET meta_due=0,meta_checked=0,meta_claimed=0 WHERE type='series'")
+            self.db.execute("INSERT OR REPLACE INTO settings VALUES ('store_schema_version','2')")
+
+    @staticmethod
+    def search_names(*documents):
+        """Keep translated/original names searchable when previews are refreshed."""
+        names = set()
+        fields = ('name', 'title', 'originalName', 'originalTitle', 'original_name',
+                  'original_title', 'alternativeTitles', 'alternative_titles', 'aliases', 'titles')
+
+        def collect(value):
+            if isinstance(value, str) and value.strip():
+                names.add(folded(value.strip()))
+            elif isinstance(value, list):
+                for item in value:
+                    collect(item)
+            elif isinstance(value, dict):
+                for key in fields:
+                    if key in value:
+                        collect(value[key])
+
+        for document in documents:
+            collect(document)
+        return '\n'.join(sorted(names))
 
     def setting(self, key, value=None):
         with self.lock:
@@ -173,7 +278,7 @@ class Store:
         dedicated profile that is never switched over, so its manifest is authoritative:
         shelves it no longer offers are retired rather than left stale."""
         with self.lock:
-            self.db.execute('UPDATE categories SET active=0')
+            retained = set()
             for position, cat in enumerate(catalogs):
                 if cat.get('type') not in ('movie', 'series'):
                     continue
@@ -182,11 +287,20 @@ class Store:
                 if is_scanner_catalog(cat['id'], instance_id):
                     continue
                 cid = 'cached-' + hashlib.sha256((cat['type'] + '/' + cat['id']).encode()).hexdigest()[:16]
+                retained.add(cid)
                 self.db.execute(
                     '''INSERT INTO categories(id,type,name,upstream,position,extra,active) VALUES (?,?,?,?,?,?,1)
                        ON CONFLICT(id) DO UPDATE SET name=excluded.name,position=excluded.position,
-                       extra=excluded.extra,active=1''',
+                       extra=excluded.extra,
+                       offset=CASE WHEN categories.active=0 THEN 0 ELSE categories.offset END,
+                       done=CASE WHEN categories.active=0 THEN 0 ELSE categories.done END,
+                       refresh=CASE WHEN categories.active=0 THEN 0 ELSE categories.refresh END,
+                       generation=CASE WHEN categories.active=0 THEN categories.generation+1 ELSE categories.generation END,
+                       active=1''',
                     (cid, cat['type'], cat.get('name', cat['id']), cat['id'], position, encode(cat.get('extra', []))))
+            for row in self.db.execute('SELECT id FROM categories WHERE active=1').fetchall():
+                if row['id'] not in retained:
+                    self.db.execute('UPDATE categories SET active=0,generation=generation+1 WHERE id=?', (row['id'],))
             retired = [row[0] for row in self.db.execute('SELECT id FROM categories WHERE active=0').fetchall()]
             if retired:
                 marks = ','.join('?' for _ in retired)
@@ -198,7 +312,12 @@ class Store:
 
     def add_page(self, cat, previews, offset, cap):
         with self.lock:
-            generation = time.time() if offset == 0 else cat['generation']
+            current = self.db.execute('SELECT active,generation FROM categories WHERE id=?', (cat['id'],)).fetchone()
+            if current is None or not current['active'] or current['generation'] != cat['generation']:
+                # A response may arrive after the category was removed/restored or
+                # after another crawl started. It must not revive obsolete members.
+                return False
+            generation = max(time.time(), current['generation'] + 1) if offset == 0 else cat['generation']
             if offset == 0:
                 self.db.execute('UPDATE categories SET generation=? WHERE id=?', (generation, cat['id']))
             new = 0
@@ -211,11 +330,14 @@ class Store:
                 # Breadth first: the first page of every shelf is indexed before the
                 # second, and the curated family shelves come before everything else.
                 shelf = -100 if 'familycurated' in cat['upstream'] else offset // 20
+                previous = self.db.execute('SELECT meta,search FROM titles WHERE type=? AND id=?', (kind, ident)).fetchone()
+                search = self.search_names(p, json.loads(previous['meta'] or '{}') if previous else {},
+                                           previous['search'].splitlines() if previous and previous['search'] else [])
                 self.db.execute('''INSERT INTO titles(type,id,preview,search,priority,rank) VALUES (?,?,?,?,?,?)
                   ON CONFLICT(type,id) DO UPDATE SET preview=excluded.preview,search=excluded.search,
                   priority=CASE WHEN titles.priority<excluded.priority THEN titles.priority ELSE excluded.priority END,
                   rank=CASE WHEN titles.rank<excluded.rank THEN titles.rank ELSE excluded.rank END''',
-                  (kind, ident, encode(p), folded(p.get('name', '')), shelf, offset + n))
+                  (kind, ident, encode(p), search, shelf, offset + n))
                 seen = self.db.execute('SELECT seen FROM membership WHERE category=? AND type=? AND id=?', (cat['id'], kind, ident)).fetchone()
                 new += int(seen is None or seen[0] != generation)
                 self.db.execute('''INSERT INTO membership VALUES (?,?,?,?,?) ON CONFLICT(category,type,id)
@@ -230,41 +352,58 @@ class Store:
             self.db.execute('UPDATE categories SET offset=?,done=?,refresh=? WHERE id=?',
                             (offset + len(previews), int(done), time.time() + 86400 if done else 0, cat['id']))
             self.db.commit()
+            return True
 
     def save_meta(self, kind, ident, meta, now):
         with self.lock:
-            if not isinstance(meta, dict) or not meta.get('id'):
-                self.db.execute('UPDATE titles SET meta_due=? WHERE type=? AND id=?', (now + 1800, kind, ident))
+            title = self.db.execute('''SELECT * FROM titles t WHERE type=? AND id=? AND EXISTS
+              (SELECT 1 FROM membership m JOIN categories c ON c.id=m.category
+               WHERE m.type=t.type AND m.id=t.id AND c.active=1)''', (kind, ident)).fetchone()
+            if title is None:
+                return
+            videos = []
+            valid = isinstance(meta, dict) and isinstance(meta.get('id'), str) and bool(meta['id'])
+            if valid and kind == 'series':
+                listed = meta.get('videos')
+                valid = isinstance(listed, list) and all(isinstance(v, dict) for v in listed)
+                if valid:
+                    videos = sorted((v for v in listed if isinstance(v.get('id'), str)
+                                     and isinstance(v.get('released'), str) and aired(v, now)),
+                                    key=lambda v: (v['season'] == 0, v['season'], v['episode'], v['id']))
+                    valid = bool(videos)
+            if not valid:
+                # Empty/malformed metadata is not evidence that existing episodes
+                # disappeared. Keep both previous metadata and check results.
+                self.db.execute('UPDATE titles SET meta_due=?,meta_claimed=0 WHERE type=? AND id=?',
+                                (now + 1800, kind, ident))
                 self.db.commit()
                 return
             meta = copy.deepcopy(meta)
             meta.pop('streams', None)
-            self.db.execute('UPDATE titles SET meta=?,meta_due=?,meta_checked=?,search=search || ? WHERE type=? AND id=?',
-                            (encode(meta), now + 86400, now, ' ' + folded(meta.get('name', '')), kind, ident))
+            # Retain translated names encountered in previous metadata responses.
+            search = self.search_names(json.loads(title['preview']), meta,
+                                       json.loads(title['meta'] or '{}'), (title['search'] or '').splitlines())
+            self.db.execute('UPDATE titles SET meta=?,meta_due=?,meta_checked=?,meta_claimed=0,search=? WHERE type=? AND id=?',
+                            (encode(meta), now + 86400, now, search, kind, ident))
             if kind == 'series':
-                listed = meta.get('videos') or []
-                videos = sorted((v for v in listed if aired(v, now)), key=episode_order)[:self.max_episodes]
-                if not videos:
-                    # An episode list that yields nothing usable is a failed fetch,
-                    # not evidence about the show. Keep existing checks and retry soon
-                    # rather than caching emptiness for a day.
-                    self.db.execute('UPDATE titles SET meta_checked=?,meta_due=? WHERE type=? AND id=?',
-                                    (now, now + 1800, kind, ident))
-                    self.db.commit()
-                    return
-                curated = self.db.execute("SELECT 1 FROM membership m JOIN categories c ON c.id=m.category WHERE m.type=? AND m.id=? AND c.upstream LIKE 'familycurated%' LIMIT 1", (kind, ident)).fetchone()
-                for video in videos:
-                    self.db.execute('INSERT OR IGNORE INTO checks(type,id,parent,priority) VALUES (?,?,?,?)',
-                                    (kind, video['id'], ident, (-100 if curated else 0) if video['episode'] == 1 else 10))
+                # max_episodes controls the worker's batch size, never completeness
+                # of the persistent candidate list. Start regular seasons in order;
+                # specials follow the main series.
+                for position, video in enumerate(videos):
+                    self.db.execute('''INSERT INTO checks(type,id,parent,priority) VALUES (?,?,?,?)
+                      ON CONFLICT(type,id,parent) DO UPDATE SET priority=excluded.priority''',
+                                    (kind, video['id'], ident, position))
                 keep = {v['id'] for v in videos}
                 for row in self.db.execute('SELECT id FROM checks WHERE type=? AND parent=?', (kind, ident)).fetchall():
                     if row['id'] not in keep:
-                        self.db.execute('DELETE FROM checks WHERE type=? AND id=?', (kind, row['id']))
+                        self.db.execute('DELETE FROM checks WHERE type=? AND id=? AND parent=?', (kind, row['id'], ident))
             self.db.commit()
 
     def record(self, kind, ident, parent, verdict, count, now):
         with self.lock:
-            row = self.db.execute('SELECT * FROM checks WHERE type=? AND id=? AND parent=?', (kind, ident, parent)).fetchone()
+            row = self.db.execute('''SELECT * FROM checks c WHERE type=? AND id=? AND parent=? AND EXISTS
+              (SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category
+               WHERE m.type=c.type AND m.id=c.parent AND cat.active=1)''', (kind, ident, parent)).fetchone()
             if row is None:
                 return
             if verdict == 'error':
@@ -279,8 +418,25 @@ class Store:
             self.db.commit()
 
     def visible(self, kind, ident, now):
-        return self.db.execute("SELECT 1 FROM checks WHERE type=? AND parent=? AND status='available' AND expires>? LIMIT 1",
+        return self.db.execute('''SELECT 1 FROM checks c WHERE type=? AND parent=? AND status='available' AND expires>?
+          AND EXISTS (SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category
+            WHERE m.type=c.type AND m.id=c.parent AND cat.active=1) LIMIT 1''',
                                (kind, ident, now + 60)).fetchone() is not None
+
+    @staticmethod
+    def canonical_id(preview, meta):
+        """Only merge aliases with an explicit shared identifier, never by title."""
+        for document in (meta, preview):
+            for field in ('imdb_id', 'imdbId'):
+                ident = document.get(field)
+                if isinstance(ident, str) and re.fullmatch(r'tt\d+', ident):
+                    return ident
+            providers = document.get('providerIds') or document.get('ProviderIds') or {}
+            if isinstance(providers, dict):
+                ident = providers.get('Imdb') or providers.get('imdb') or providers.get('IMDB')
+                if isinstance(ident, str) and re.fullmatch(r'tt\d+', ident):
+                    return ident
+        return meta.get('id') or preview['id']
 
     def catalog(self, kind, cid, skip=0, search=None, genre=None, now=None):
         now = time.time() if now is None else now
@@ -288,24 +444,50 @@ class Store:
             if search is not None:
                 rows = self.db.execute('''SELECT t.* FROM titles t WHERE t.type=? AND EXISTS
                   (SELECT 1 FROM checks c WHERE c.type=t.type AND c.parent=t.id AND c.status='available' AND c.expires>?)
-                  AND EXISTS (SELECT 1 FROM membership m WHERE m.type=t.type AND m.id=t.id)
+                  AND EXISTS (SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category
+                    WHERE m.type=t.type AND m.id=t.id AND cat.active=1)
                   ORDER BY t.id''', (kind, now + 60)).fetchall()
             else:
                 rows = self.db.execute('''SELECT t.* FROM membership m JOIN titles t ON t.type=m.type AND t.id=m.id
-                  WHERE m.category=? AND t.type=? AND EXISTS
+                  JOIN categories cat ON cat.id=m.category WHERE cat.active=1 AND m.category=? AND t.type=? AND EXISTS
                   (SELECT 1 FROM checks c WHERE c.type=t.type AND c.parent=t.id AND c.status='available' AND c.expires>?)
                   ORDER BY m.rank,t.id''', (cid, kind, now + 60)).fetchall()
             result = []
+            seen = set()
             query = folded(search or '')
             for row in rows:
                 if query and query not in row['search']:
                     continue
                 preview = json.loads(row['preview'])
-                if genre and genre not in preview.get('genres', []) and genre not in json.loads(row['meta'] or '{}').get('genres', []):
+                meta = json.loads(row['meta'] or '{}')
+                genres = sorted(set(x for x in (preview.get('genres') or []) + (meta.get('genres') or []) if isinstance(x, str)))
+                if genre and genre not in genres:
                     continue
+                canonical = self.canonical_id(preview, meta)
+                if canonical in seen:
+                    continue
+                seen.add(canonical)
                 preview.pop('videos', None)
+                preview['genres'] = genres
                 result.append(preview)
             return result[max(0, skip):max(0, skip) + 100]
+
+    def genres(self, kind, now=None):
+        """Genre facets come from the same currently verified pool as catalogues."""
+        now = time.time() if now is None else now
+        with self.lock:
+            rows = self.db.execute('''SELECT t.preview,t.meta FROM titles t WHERE t.type=? AND EXISTS
+              (SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category
+               WHERE m.type=t.type AND m.id=t.id AND cat.active=1) AND EXISTS
+              (SELECT 1 FROM checks c WHERE c.type=t.type AND c.parent=t.id AND c.status='available' AND c.expires>?)''',
+                                   (kind, now + 60)).fetchall()
+            values = set()
+            for row in rows:
+                for data in (row['preview'], row['meta']):
+                    for genre in json.loads(data or '{}').get('genres') or []:
+                        if isinstance(genre, str) and genre.strip():
+                            values.add(genre)
+            return sorted(values, key=folded)
 
     def meta(self, kind, ident, now=None):
         now = time.time() if now is None else now
@@ -382,10 +564,17 @@ class App:
                            options.get('max_episodes_per_series', 12))
         self.ready = False
         self.error = 'Initialising'
+        self.provider_errors_visible = False
         self.policy_lock = threading.RLock()
         self.inflight = set()
+        self.check_queue = deque()
         self.stop = threading.Event()
         self.heartbeats = {}
+        self.threads = {}
+        self.worker_errors = {}
+        self.pacing_lock = threading.Lock()
+        self.next_stream_request = 0.0
+        self.cooldown_until = 0.0
         self.instance_id = options.get('scanner_instance_id', 'cachedlibrary')
         self.delay = float(options.get('check_delay_seconds', 2))
         self.base = (options.get('aiostreams_url') or '').rstrip('/')
@@ -422,6 +611,12 @@ class App:
             problems.append('active_uuid and active_password are required')
         if not self.o.get('stremio_uuid') or not self.o.get('stremio_encrypted_password'):
             problems.append('stremio_uuid and stremio_encrypted_password are required')
+        if not self.o.get('catalog_uuid') or not self.o.get('catalog_encrypted_password'):
+            problems.append('A separate original catalogue/metadata profile is required')
+        elif self.o.get('catalog_uuid') == self.o.get('stremio_uuid'):
+            problems.append('Catalogue metadata must not use the filtered playback profile')
+        if self.o.get('active_uuid') != self.o.get('stremio_uuid'):
+            problems.append('The policy and stream profile UUIDs must match')
         if len(self.o['endpoint_token']) < 24:
             problems.append('endpoint_token must be at least 24 characters when set')
         return problems
@@ -436,10 +631,34 @@ class App:
         return not any(e.get('name') == 'search' and e.get('isRequired') for e in catalog.get('extra', []))
 
     def upstream_catalogs(self):
-        catalogs = [c for c in self.request('/manifest.json', catalog=True).get('catalogs', []) if self.is_upstream(c)]
-        if not catalogs and self.catalog_source != self.source:
-            catalogs = [c for c in self.request('/manifest.json').get('catalogs', []) if self.is_upstream(c)]
+        manifest = self.request('/manifest.json', catalog=True)
+        if any(is_scanner_catalog(c.get('id', ''), self.instance_id) for c in manifest.get('catalogs', [])):
+            raise ValueError('The original catalogue profile must not include Cached Media Library')
+        catalogs = [c for c in manifest.get('catalogs', []) if self.is_upstream(c)]
         return catalogs
+
+    def pace_stream(self):
+        interval = 60 / max(1, self.o.get('stream_requests_per_minute', 30))
+        while not self.stop.is_set():
+            with self.pacing_lock:
+                now = time.monotonic()
+                wait = max(self.next_stream_request, self.cooldown_until) - now
+                if wait <= 0:
+                    self.next_stream_request = now + interval
+                    return
+            self.stop.wait(min(wait, 5))
+        raise RuntimeError('Stopping')
+
+    def backoff(self, retry_after=None):
+        try:
+            seconds = float(retry_after)
+        except (TypeError, ValueError):
+            try:
+                seconds = parsedate_to_datetime(retry_after).timestamp() - time.time()
+            except (TypeError, ValueError, AttributeError):
+                seconds = 20
+        with self.pacing_lock:
+            self.cooldown_until = max(self.cooldown_until, time.monotonic() + min(300, max(20, seconds)))
 
     def request(self, path, config=False, catalog=False):
         """Read-only. `config=True` reads profile settings over the dashboard API,
@@ -451,10 +670,20 @@ class App:
             url = self.base + path
         else:
             url = (self.catalog_source if catalog else self.source) + path
-        with urlopen(Request(url, headers=headers), timeout=65) as response:
-            return json.load(response)
+        is_stream = path.startswith('/stream/')
+        if is_stream:
+            self.pace_stream()
+        try:
+            with urlopen(Request(url, headers=headers), timeout=65) as response:
+                return json.load(response)
+        except HTTPError as exc:
+            if is_stream and exc.code in (429, 503):
+                self.backoff(exc.headers.get('Retry-After'))
+            raise
 
     def check_policy(self, config):
+        if config.get('parentConfig') or config.get('variants'):
+            return 'Inherited or conditional playback policies require a resolved scanner policy'
         if not config.get('excludeUncached'):
             return 'AIOStreams is not excluding uncached streams'
         if not any(e.get('enabled') and e.get('expression', '').strip() == STRICT_FILTER for e in config.get('requiredStreamExpressions', [])):
@@ -474,6 +703,7 @@ class App:
             raise ValueError('no upstream catalogues found in the profile manifest')
         fingerprint = policy_fingerprint(config)
         with self.policy_lock:
+            self.provider_errors_visible = not config.get('hideErrors') and 'stream' not in config.get('hideErrorsForResources', [])
             changed = self.store.setting('policy') != fingerprint
             if changed:
                 self.ready = False
@@ -481,6 +711,8 @@ class App:
             if changed:
                 self.store.invalidate()
                 self.store.setting('policy', fingerprint)
+                with self.store.lock:
+                    self.check_queue.clear()
             self.ready, self.error = True, None
             self.store.setting('last_sync', time.time())
 
@@ -524,7 +756,8 @@ class App:
                     self.store.add_page(cat, result['metas'], offset, self.o.get('max_candidates_per_category', 1000))
                 except Exception as exc:
                     with self.store.lock:
-                        self.store.db.execute('UPDATE categories SET done=1,refresh=? WHERE id=?', (time.time() + 600, cat['id']))
+                        self.store.db.execute('UPDATE categories SET done=1,refresh=? WHERE id=? AND active=1 AND generation=?',
+                                              (time.time() + 600, cat['id'], cat['generation']))
                         self.store.db.commit()
                     print('Catalogue retry scheduled: ' + type(exc).__name__, flush=True)
                 worked = True
@@ -538,8 +771,8 @@ class App:
         long-running shows, so this runs in several threads and must not double-pick."""
         now = time.time()
         with self.store.lock:
-            row = self.store.db.execute('''SELECT t.* FROM titles t WHERE t.meta_due<? AND t.meta_claimed<?
-              AND EXISTS(SELECT 1 FROM membership m WHERE m.type=t.type AND m.id=t.id)
+            row = self.store.db.execute('''SELECT t.type,t.id FROM titles t WHERE t.meta_due<? AND t.meta_claimed<?
+              AND EXISTS(SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category WHERE m.type=t.type AND m.id=t.id AND cat.active=1)
               AND (t.type='series' OR EXISTS(SELECT 1 FROM checks c WHERE c.type=t.type AND c.parent=t.id AND c.status='available'))
               ORDER BY (t.meta_checked>0),t.priority,t.rank,t.meta_checked,t.id LIMIT 1''', (now, now)).fetchone()
             if row:
@@ -559,7 +792,7 @@ class App:
                 self.stop.wait(5)
                 continue
             try:
-                result = self.request('/meta/' + row['type'] + '/' + quote(row['id'], safe='') + '.json')
+                result = self.request('/meta/' + row['type'] + '/' + quote(row['id'], safe='') + '.json', catalog=True)
                 self.store.save_meta(row['type'], row['id'], result.get('meta'), time.time())
             except Exception:
                 self.store.save_meta(row['type'], row['id'], None, time.time())
@@ -567,19 +800,45 @@ class App:
 
     def next_check(self, preferred):
         with self.store.lock:
-            # Refresh positives before they expire, then work the backlog.
+            now = time.time()
+            # Indexed urgent renewals, independent of the size of the episode backlog.
             rows = self.store.db.execute('''SELECT c.* FROM checks c
-              LEFT JOIN titles t ON t.type=c.type AND t.id=c.parent
-              WHERE c.due<? AND EXISTS (SELECT 1 FROM membership m WHERE m.type=c.type AND m.id=c.parent)
-              ORDER BY CASE WHEN c.status='available' THEN 0 ELSE 1 END,(c.type!=?),
-              COALESCE(t.priority,9999),COALESCE(t.rank,999999),
-              (SELECT max(c2.attempted) FROM checks c2 WHERE c2.type=c.type AND c2.parent=c.parent),c.attempted,c.id
-              LIMIT 100''', (time.time(), preferred)).fetchall()
+              WHERE c.status='available' AND c.due<? AND EXISTS
+              (SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category
+               WHERE m.type=c.type AND m.id=c.parent AND cat.active=1)
+              ORDER BY c.due LIMIT 100''', (now,)).fetchall()
             for row in rows:
-                key = (row['type'], row['id'])
+                key = (row['type'], row['id'], row['parent'])
                 if key not in self.inflight:
                     self.inflight.add(key)
                     return row
+            while True:
+                while self.check_queue:
+                    queued = self.check_queue.popleft()
+                    row = self.store.db.execute('''SELECT c.* FROM checks c WHERE c.type=? AND c.id=? AND c.parent=?
+                      AND c.due<? AND EXISTS(SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category
+                      WHERE m.type=c.type AND m.id=c.parent AND cat.active=1)''', (*queued, now)).fetchone()
+                    if row is not None and queued not in self.inflight:
+                        self.inflight.add(queued)
+                        return row
+                title = self.store.db.execute('''SELECT t.type,t.id FROM titles t
+                  WHERE EXISTS(SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category
+                    WHERE m.type=t.type AND m.id=t.id AND cat.active=1)
+                  AND EXISTS(SELECT 1 FROM checks c WHERE c.type=t.type AND c.parent=t.id AND c.due<?)
+                  ORDER BY (t.type!=?),(t.scan_touched>0),t.scan_touched,t.priority,t.rank,t.id LIMIT 1''',
+                  (now, preferred)).fetchone()
+                if title is None:
+                    return None
+                rows = self.store.db.execute('''SELECT type,id,parent FROM checks WHERE type=? AND parent=? AND due<?
+                  ORDER BY (attempted>0),priority,due,id LIMIT ?''',
+                  (title['type'], title['id'], now, self.o.get('max_episodes_per_series', 12))).fetchall()
+                self.store.db.execute('UPDATE titles SET scan_touched=? WHERE type=? AND id=?', (now, title['type'], title['id']))
+                self.store.db.commit()
+                self.check_queue.extend((r['type'],r['id'],r['parent']) for r in rows
+                                        if (r['type'],r['id'],r['parent']) not in self.inflight)
+                if not self.check_queue:
+                    # All currently eligible work for this parent is already in flight.
+                    return None
 
     def worker(self, number):
         turn = number
@@ -593,35 +852,51 @@ class App:
             if row is None:
                 self.stop.wait(3)
                 continue
-            generation = self.store.setting('policy')
             try:
-                result = self.request('/stream/' + row['type'] + '/' + quote(row['id'], safe='') + '.json')
-                verdict, count = stream_verdict(result)
-            except HTTPError as exc:
-                verdict, count = 'error', 0
-                if exc.code in (429, 503):  # Shared per-IP limiter: back off globally.
-                    self.stop.wait(20)
-            except Exception:
-                verdict, count = 'error', 0
-            with self.policy_lock:
-                if self.ready and generation == self.store.setting('policy'):
-                    self.store.record(row['type'], row['id'], row['parent'], verdict, count, time.time())
-            with self.store.lock:
-                self.inflight.discard((row['type'], row['id']))
+                generation = self.store.setting('policy')
+                try:
+                    result = self.request('/stream/' + row['type'] + '/' + quote(row['id'], safe='') + '.json')
+                    verdict, count = stream_verdict(result)
+                    if verdict == 'unavailable' and not self.provider_errors_visible:
+                        # A filtering card may describe one provider while another
+                        # provider's failure was hidden by the playback profile.
+                        verdict = 'error'
+                except Exception:
+                    verdict, count = 'error', 0
+                with self.policy_lock:
+                    if self.ready and generation == self.store.setting('policy'):
+                        self.store.record(row['type'], row['id'], row['parent'], verdict, count, time.time())
+            finally:
+                with self.store.lock:
+                    self.inflight.discard((row['type'], row['id'], row['parent']))
             self.stop.wait(self.delay)
 
     def manifest(self):
         catalogs = []
+        genres = {kind: self.store.genres(kind) for kind in ('movie', 'series')}
         for cat in self.store.exposed_categories():
-            catalogs.append({'id': cat['id'], 'type': cat['type'], 'name': cat['name'], 'extra': [{'name': 'skip', 'isRequired': False}]})
+            extras = [{'name': 'skip', 'isRequired': False}]
+            if genres[cat['type']]:
+                extras.append({'name': 'genre', 'isRequired': False, 'options': genres[cat['type']]})
+            catalogs.append({'id': cat['id'], 'type': cat['type'], 'name': cat['name'], 'extra': extras})
         for kind in ('movie', 'series'):
             catalogs.append({'id': 'cached-search', 'type': kind, 'name': 'Available ' + kind + ' search',
                              'extra': [{'name': 'search', 'isRequired': True}, {'name': 'skip', 'isRequired': False}]})
-        return {'id': 'local.cached.media.library', 'version': '0.6.6', 'name': 'Cached Media Library',
+        return {'id': 'local.cached.media.library', 'version': '0.7.0', 'name': 'Cached Media Library',
                 'description': 'Recently verified cached streams matching your AIOStreams filters. Metadata only.',
                 'types': ['movie', 'series'],
                 'resources': ['catalog', {'name': 'meta', 'types': ['movie', 'series'], 'idPrefixes': ['tt', 'tmdb:']}],
                 'catalogs': catalogs, 'behaviorHints': {'configurable': False}, 'cacheMaxAge': 30}
+
+    def guarded(self, name, function):
+        while not self.stop.is_set():
+            try:
+                function()
+            except Exception as exc:
+                self.worker_errors[name] = {'type': type(exc).__name__, 'at': time.time()}
+                print('Restarting '+name+' after '+type(exc).__name__, flush=True)
+            if not self.stop.is_set():
+                self.stop.wait(5)
 
     def start(self):
         threads = [('sync', self.sync_loop), ('crawl', self.crawl_loop)]
@@ -629,7 +904,9 @@ class App:
         threads += [('worker' + str(i), lambda i=i: self.worker(i)) for i in range(self.o.get('workers', 2))]
         for name, func in threads:
             self.heartbeats[name] = time.time()
-            threading.Thread(target=func, name=name, daemon=True).start()
+            thread = threading.Thread(target=self.guarded, args=(name, func), name=name, daemon=True)
+            self.threads[name] = thread
+            thread.start()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -662,6 +939,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path in ('/', '/health', '/status'):
             status = {'ready': app.ready, 'issue': app.error, 'last_policy_sync': app.store.setting('last_sync'),
+                      'worker_errors': app.worker_errors,
+                      'workers_alive': {k: v.is_alive() for k,v in app.threads.items()},
                       'worker_ages': {k: round(time.time() - v) for k, v in app.heartbeats.items()}, **app.store.status()}
             unhealthy = not app.ready or any(v > 420 for v in status['worker_ages'].values())
             self.send(status, 503 if path == '/health' and unhealthy else 200)

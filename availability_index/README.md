@@ -1,8 +1,10 @@
 # Cached Media Library
 
-Verified cached discovery and search for an AIOStreams Jellyfin-compatible
-server. See [the documentation](DOCS.md) for options, switch-over and
-troubleshooting.
+Discovery and search for an AIOStreams Jellyfin-compatible server, limited to
+titles with recently confirmed cached streams. Availability may change between a
+background check and playback; the playback profile still enforces cached-only
+stream filtering.
 
-This app only reads AIOStreams. It publishes catalogues and metadata, and never
-serves or proxies video.
+A separate profile supplies unfiltered catalogues and metadata. The app only reads
+AIOStreams, publishes catalogues and metadata, and never serves or proxies video.
+See [the documentation](DOCS.md) before installing or upgrading to 0.7.0.

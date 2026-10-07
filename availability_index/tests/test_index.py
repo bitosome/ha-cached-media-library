@@ -28,6 +28,7 @@ class IndexTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def add(self, count=1):
+        self.cat = self.s.db.execute('SELECT * FROM categories WHERE id=?', (self.cat['id'],)).fetchone()
         self.s.add_page(self.cat, [{'id': 'tt%07d' % i, 'name': 'Movie %d' % i} for i in range(count)], 0, 1000)
 
     def test_filter_before_pagination_and_search(self):
@@ -63,8 +64,8 @@ class IndexTests(unittest.TestCase):
         videos = [{'id': 'tt123:1:%d' % i, 'season': 1, 'episode': i, 'released': PAST} for i in range(1, 4)]
         videos.append({'id': 'tt123:1:4', 'season': 1, 'episode': 4, 'released': FUTURE})
         self.s.save_meta('series', 'tt123', {'id': 'tt123', 'name': 'Ёжик', 'type': 'series', 'videos': videos}, NOW)
-        # Unaired episodes are never queued, and the per-series cap is applied.
-        self.assertEqual(self.s.db.execute('SELECT count(*) FROM checks').fetchone()[0], 2)
+        # Unaired episodes are never queued; every aired episode remains a candidate.
+        self.assertEqual(self.s.db.execute('SELECT count(*) FROM checks').fetchone()[0], 3)
         self.assertEqual(self.s.db.execute('SELECT count(*) FROM checks WHERE id=?', ('tt123:1:4',)).fetchone()[0], 0)
         self.assertIsNone(self.s.meta('series', 'tt123', NOW + 1))
         self.s.record('series', 'tt123:1:2', 'tt123', 'available', 1, NOW)
@@ -92,7 +93,7 @@ class IndexTests(unittest.TestCase):
     def test_stream_notices_and_timeouts(self):
         self.assertEqual(stream_verdict({'streams': [{'name': 'Removal Reasons', 'description': 'Excluded Uncached (8)'}]}), ('unavailable', 0))
         self.assertEqual(stream_verdict({'streams': [{'name': 'Provider error', 'description': 'Timeout'}]}), ('error', 0))
-        self.assertEqual(stream_verdict({'streams': [{'infoHash': 'abc'}, {'externalUrl': 'https://example.com'}]}), ('unavailable', 0))
+        self.assertEqual(stream_verdict({'streams': [{'infoHash': 'abc'}, {'externalUrl': 'https://example.com'}]}), ('error', 0))
         self.assertEqual(stream_verdict({'streams': [{'url': 'https://example.com/play'}]}), ('available', 1))
         self.assertFalse(aired({'id': 'x', 'season': 1, 'episode': 1}, 1000))
 
@@ -166,7 +167,7 @@ class ConfigurationTests(unittest.TestCase):
         app = self.app(aiostreams_url='', active_uuid='', active_password='',
                        stremio_uuid='', stremio_encrypted_password='', endpoint_token='short')
         problems = app.config_problems()
-        self.assertEqual(len(problems), 4)
+        self.assertEqual(len(problems), 5)
 
     def test_catalog_source_defaults_to_the_active_profile(self):
         app = self.app()
@@ -194,7 +195,8 @@ class ConfigurationTests(unittest.TestCase):
         ], 'cachedlibrary')
         cats = app.store.db.execute('SELECT * FROM categories ORDER BY position').fetchall()
         app.store.add_page(cats[0], [{'id': 'ttshallow', 'name': 'A'}], 0, 1000)
-        app.store.add_page(cats[0], [{'id': 'ttdeep', 'name': 'B'}], 400, 1000)
+        fresh = app.store.db.execute('SELECT * FROM categories WHERE id=?', (cats[0]['id'],)).fetchone()
+        app.store.add_page(fresh, [{'id': 'ttdeep', 'name': 'B'}], 400, 1000)
         app.store.add_page(cats[1], [{'id': 'ttcurated', 'name': 'C'}], 0, 1000)
         order = [row[0] for row in app.store.db.execute(
             'SELECT id FROM titles ORDER BY priority,id').fetchall()]
@@ -207,6 +209,7 @@ class ConfigurationTests(unittest.TestCase):
         cat = app.store.db.execute('SELECT * FROM categories').fetchone()
         # Page 2 is crawled first so the alphabetical order would be the wrong answer.
         app.store.add_page(cat, [{'id': 'tt9', 'name': 'Unpopular'}], 20, 1000)
+        cat = app.store.db.execute('SELECT * FROM categories WHERE id=?', (cat['id'],)).fetchone()
         app.store.add_page(cat, [{'id': 'tt1', 'name': 'Popular'}], 0, 1000)
         first = app.next_check('movie')
         self.assertEqual(first['id'], 'tt1')

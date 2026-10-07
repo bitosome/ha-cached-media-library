@@ -10,24 +10,24 @@ configuration:
       cached-only filter is still enforced.
   active_password:
     name: Profile password
-    description: Password of that profile.
+    description: Playback profile configuration password, not dashboard administrator password.
   stremio_uuid:
     name: Stremio endpoint UUID
     description: >-
-      UUID used in the profile's Stremio endpoint. Usually the same as the
-      profile UUID.
+      Playback profile Stremio UUID. Must match the profile UUID used to read
+      the cached-only filter settings.
   stremio_encrypted_password:
     name: Stremio encrypted password
     description: >-
       The profile's encrypted password, the last segment of its Stremio URL.
   catalog_uuid:
-    name: Catalogue source UUID (optional)
+    name: Catalogue and metadata source UUID
     description: >-
-      UUID of the profile whose catalogues are indexed. Use a profile that keeps
-      the upstream catalogues enabled and is never switched over. Defaults to the
-      Stremio endpoint UUID.
+      Required UUID of a separate profile with the original upstream catalogues
+      and metadata providers enabled. Must differ from the playback profile and
+      must never include Cached Media Library.
   catalog_encrypted_password:
-    name: Catalogue source encrypted password (optional)
+    name: Source profile encrypted password
     description: Encrypted password of that profile.
   endpoint_token:
     name: Endpoint token
@@ -36,25 +36,26 @@ configuration:
       and remember one; the manifest URL is printed in the app log at startup.
   positive_hours:
     name: Positive result lifetime (hours)
-    description: How long a confirmed cached stream stays published.
+    description: How long a cached-stream confirmation remains valid. Availability can change afterward.
   negative_hours:
     name: Negative result lifetime (hours)
-    description: How long a negative result is trusted before it is rechecked.
+    description: How long an explicit negative result is retained. Errors and unexplained empty responses are retried as unknown.
   max_candidates_per_category:
     name: Catalogue depth
     description: >-
       How deep each catalogue is indexed. Larger values give broader coverage
       and take longer to complete. Search only covers what is indexed.
   max_episodes_per_series:
-    name: Episode checks per series
+    name: Progressive episode batch size
     description: >-
-      Episode checks queued per show, prioritising each newest season's opener.
-      Only confirmed episodes are exposed.
+      Checks scheduled per show before moving on. All aired candidates remain
+      eligible; this is not a permanent episode limit. Only confirmed episodes
+      are exposed.
   workers:
     name: Concurrent checks
     description: >-
-      Parallel availability checks. Keep this under AIOStreams' Stremio stream
-      rate limit, or the app backs off on HTTP 429 responses.
+      Parallel availability checks. All workers share the requests-per-minute
+      budget and pause together after upstream rate limits.
   metadata_workers:
     name: Concurrent metadata fetches
     description: >-
@@ -63,8 +64,13 @@ configuration:
   check_delay_seconds:
     name: Delay between checks (seconds)
     description: >-
-      Pause each worker takes between availability checks. Lower is faster and
-      uses more of the stream rate limit.
+      Additional pause each worker takes between checks. Lower values do not
+      bypass the shared requests-per-minute budget.
+  stream_requests_per_minute:
+    name: Shared stream requests per minute
+    description: >-
+      Total request budget across all check workers. Default 30. Keep below the
+      effective AIOStreams limit, leaving headroom for playback and other clients.
   scanner_instance_id:
     name: AIOStreams add-on instance ID
     description: >-
