@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.3
+
+- Share episode availability evidence between explicitly matching IMDb/TMDB title
+  aliases only when the episode request ID is identical. Preserve original times,
+  expiry, policy scope and newer negative evidence; repair existing split evidence
+  once, then keep aliases consistent during metadata refreshes and new checks.
+
+- Add `catalog_refresh_hours` (default 6, range 1–48) for source catalogue refreshes.
+  Stream checking remains continuous and uses its own confirmation/retry schedule.
+- Persist the configured catalogue depth. Changing depth requeues paginated shelves
+  immediately instead of waiting for the old daily refresh; existing membership
+  and availability evidence are preserved until the new crawl completes.
+- Re-crawl active shelves once when upgrading an index without saved crawl settings.
+  Repeated profile synchronisation no longer needs to trigger another reset.
+- Preserve prior shelf members when an empty upstream response could be a provider
+  failure. Retry ambiguous emptiness, and reject malformed catalogue previews,
+  instead of treating either as evidence that content should disappear.
+
 ## 0.7.2
 
 - Keep separate movie and series work queues so episode batches cannot consume

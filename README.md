@@ -55,6 +55,9 @@ genre shelves, and curated family selections such as Лучшие мультсе
 It publishes available candidates from the source profile.
 
 Set AIOStreams `jellyfin.maxLibraries` high enough for the published shelf count.
+Source shelves refresh every six hours by default (`catalog_refresh_hours`);
+availability checks run continuously. Increasing catalogue depth schedules a new
+crawl immediately while preserving existing confirmations.
 Genre options and known title aliases are carried through where source metadata
 supplies them; titles without that metadata cannot be reliably classified or merged.
 

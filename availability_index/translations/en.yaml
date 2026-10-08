@@ -51,6 +51,12 @@ configuration:
       Checks scheduled per show before moving on. All aired candidates remain
       eligible; this is not a permanent episode limit. Only confirmed episodes
       are exposed.
+  catalog_refresh_hours:
+    name: Catalogue refresh interval (hours)
+    description: >-
+      How often completed source catalogues are crawled again. Default 6, range
+      1–48. Stream availability is checked continuously on its separate schedule.
+      Increasing catalogue depth starts a fresh crawl without clearing confirmations.
   workers:
     name: Concurrent checks
     description: >-

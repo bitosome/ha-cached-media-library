@@ -172,8 +172,9 @@ def is_scanner_catalog(catalog_id, instance_id):
 
 
 class Store:
-    def __init__(self, path, positive=43200, negative=86400, max_episodes=12):
+    def __init__(self, path, positive=43200, negative=86400, max_episodes=12, catalog_refresh=21600):
         self.path, self.positive, self.negative, self.max_episodes = path, positive, negative, max_episodes
+        self.catalog_refresh = catalog_refresh
         self.lock = threading.RLock()
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -312,6 +313,43 @@ class Store:
                 self.db.execute('DELETE FROM titles WHERE NOT EXISTS (SELECT 1 FROM membership m WHERE m.type=titles.type AND m.id=titles.id)')
             self.db.commit()
 
+    def configure_crawl(self, cap, refresh_hours):
+        """Apply crawl settings once without discarding membership or evidence.
+
+        Old databases have no recorded depth: re-crawl their active shelves once.
+        A depth change starts a new generation for paginated shelves, including
+        those previously marked complete, instead of waiting for tomorrow.
+        """
+        settings = {'max_candidates': cap, 'refresh_hours': refresh_hours}
+        with self.lock:
+            previous = self.setting('crawl_settings')
+            self.catalog_refresh = refresh_hours * 3600
+            if previous == settings:
+                return 0
+            legacy = not isinstance(previous, dict) or 'max_candidates' not in previous
+            depth_changed = legacy or previous['max_candidates'] != cap
+            restarted = 0
+            for cat in self.db.execute('SELECT * FROM categories WHERE active=1').fetchall():
+                paginated = any(e.get('name') == 'skip' for e in json.loads(cat['extra']))
+                if legacy or (depth_changed and paginated):
+                    self.db.execute('''UPDATE categories SET offset=0,done=0,refresh=0,
+                      generation=generation+1 WHERE id=?''', (cat['id'],))
+                    restarted += 1
+                elif cat['done'] and cat['refresh'] > 0:
+                    old_hours = previous.get('refresh_hours', 24)
+                    if old_hours > refresh_hours:
+                        # refresh is the previous completion time plus its old
+                        # interval. A shorter interval may already be overdue.
+                        # Never postpone an existing deadline when lengthening
+                        # the interval: it may instead be a short provider retry.
+                        # The next successful crawl adopts the longer interval.
+                        deadline = cat['refresh'] + (refresh_hours - old_hours) * 3600
+                        self.db.execute('UPDATE categories SET refresh=? WHERE id=?',
+                                        (max(0, deadline), cat['id']))
+            self.db.execute("INSERT OR REPLACE INTO settings VALUES ('crawl_settings',?)", (encode(settings),))
+            self.db.commit()
+            return restarted
+
     def add_page(self, cat, previews, offset, cap):
         with self.lock:
             current = self.db.execute('SELECT active,generation FROM categories WHERE id=?', (cat['id'],)).fetchone()
@@ -319,6 +357,36 @@ class Store:
                 # A response may arrive after the category was removed/restored or
                 # after another crawl started. It must not revive obsolete members.
                 return False
+            remaining = max(0, cap - offset)
+            if remaining == 0:
+                # The configured depth is itself a complete stopping condition,
+                # including a resumed crawl already at its boundary. No upstream
+                # response is needed to retain only members within that boundary.
+                self.db.execute('DELETE FROM membership WHERE category=? AND (seen!=? OR rank>=?)',
+                                (cat['id'], current['generation'], cap))
+                self.db.execute('UPDATE categories SET offset=?,done=1,refresh=? WHERE id=?',
+                                (cap, time.time() + self.catalog_refresh, cat['id']))
+                self.db.commit()
+                return True
+            # Providers may return full pages beyond our configured boundary.
+            # Preserve their skip progression on earlier pages; trim only the
+            # final page so a depth of 25 does not silently become 40.
+            previews = previews[:remaining]
+            if any(not isinstance(p, dict) or not isinstance(p.get('id'), str) or not p['id'] for p in previews):
+                raise ValueError('Invalid catalogue preview')
+            if not previews:
+                # AIOStreams can return an empty list after a provider failure.
+                # Never use that alone to remove previously indexed membership.
+                # An empty end page is safe to finish when every old member was
+                # already seen in the current crawl; otherwise retry from page 1.
+                unseen = self.db.execute('''SELECT 1 FROM membership WHERE category=?
+                  AND (?=0 OR seen!=?) LIMIT 1''', (cat['id'], offset, current['generation'])).fetchone()
+                retry = unseen is not None
+                refresh = time.time() + (600 if retry or offset == 0 else self.catalog_refresh)
+                self.db.execute('UPDATE categories SET offset=?,done=1,refresh=? WHERE id=?',
+                                (offset, refresh, cat['id']))
+                self.db.commit()
+                return True
             generation = max(time.time(), current['generation'] + 1) if offset == 0 else cat['generation']
             if offset == 0:
                 self.db.execute('UPDATE categories SET generation=? WHERE id=?', (generation, cat['id']))
@@ -352,7 +420,7 @@ class Store:
             if done:
                 self.db.execute('DELETE FROM membership WHERE category=? AND seen!=?', (cat['id'], generation))
             self.db.execute('UPDATE categories SET offset=?,done=?,refresh=? WHERE id=?',
-                            (offset + len(previews), int(done), time.time() + 86400 if done else 0, cat['id']))
+                            (offset + len(previews), int(done), time.time() + self.catalog_refresh if done else 0, cat['id']))
             self.db.commit()
             return True
 
@@ -399,7 +467,120 @@ class Store:
                 for row in self.db.execute('SELECT id FROM checks WHERE type=? AND parent=?', (kind, ident)).fetchall():
                     if row['id'] not in keep:
                         self.db.execute('DELETE FROM checks WHERE type=? AND id=? AND parent=?', (kind, row['id'], ident))
+                if self.setting('policy'):
+                    try:
+                        self._share_alias_checks(keep, now)
+                    except Exception:
+                        self.db.rollback()
+                        raise
             self.db.commit()
+
+    @staticmethod
+    def _explicit_imdb(preview, meta, parent):
+        """Only an unambiguous IMDb identity can link two show aliases.
+
+        Episode ids and human-readable titles alone do not establish a parent
+        relationship: some providers reuse generic episode ids across shows.
+        """
+        identities = set()
+        for value in (parent, preview.get('id'), meta.get('id')):
+            if isinstance(value, str) and re.fullmatch(r'tt\d+', value):
+                identities.add(value)
+        for document in (preview, meta):
+            for field in ('imdb_id', 'imdbId'):
+                value = document.get(field)
+                if isinstance(value, str) and re.fullmatch(r'tt\d+', value):
+                    identities.add(value)
+            providers = document.get('providerIds') or document.get('ProviderIds') or {}
+            if isinstance(providers, dict):
+                for field in ('Imdb', 'imdb', 'IMDB'):
+                    value = providers.get(field)
+                    if isinstance(value, str) and re.fullmatch(r'tt\d+', value):
+                        identities.add(value)
+        return next(iter(identities)) if len(identities) == 1 else None
+
+    def _share_alias_checks(self, episode_ids, now):
+        """Reconcile identical episode requests; caller holds lock/transaction.
+
+        All conclusive rows belong to the stored policy: invalidation removes
+        their verdicts before the policy changes. This never creates checks or
+        manufactures a new timestamp/TTL, and never shares movie-id queries.
+        """
+        ids = list(set(episode_ids))
+        identities = {}
+        shared = 0
+        for offset in range(0, len(ids), 250):
+            batch = ids[offset:offset + 250]
+            marks = ','.join('?' for _ in batch)
+            rows = self.db.execute('''SELECT c.* FROM checks c WHERE c.type='series' AND c.id IN (%s)
+              AND EXISTS(SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category
+                WHERE m.type=c.type AND m.id=c.parent AND cat.active=1)''' % marks, batch).fetchall()
+            by_episode = {}
+            for row in rows:
+                by_episode.setdefault(row['id'], []).append(row)
+            for same_episode in by_episode.values():
+                if len(same_episode) < 2:
+                    continue
+                by_identity = {}
+                for row in same_episode:
+                    parent = row['parent']
+                    if parent not in identities:
+                        title = self.db.execute("SELECT preview,meta FROM titles WHERE type='series' AND id=?", (parent,)).fetchone()
+                        try:
+                            preview = json.loads(title['preview']) if title else {}
+                            meta = json.loads(title['meta'] or '{}') if title else {}
+                            identities[parent] = self._explicit_imdb(preview, meta, parent)
+                        except (ValueError, TypeError, AttributeError):
+                            identities[parent] = None
+                    canonical = identities[parent]
+                    if canonical:
+                        by_identity.setdefault(canonical, []).append(row)
+                for aliases in by_identity.values():
+                    if len(aliases) < 2:
+                        continue
+                    evidence = [r for r in aliases if r['status'] in ('available', 'unavailable')
+                                and r['checked'] > 0]
+                    if not evidence:
+                        continue
+                    # A newer negative must suppress an older positive. Tied
+                    # contradictory verdicts are also resolved conservatively.
+                    source = max(evidence, key=lambda r: (r['checked'], r['status'] == 'unavailable', -r['expires']))
+                    ttl = self.positive if source['status'] == 'available' else self.negative
+                    expiry = min(source['expires'], source['checked'] + ttl)
+                    due = min(source['due'], expiry - 60)
+                    for target in aliases:
+                        if target['checked'] > source['checked']:
+                            continue
+                        proof = (source['status'], source['checked'], expiry, source['count'])
+                        if (target['status'], target['checked'], target['expires'], target['count']) == proof:
+                            continue
+                        cur = self.db.execute('''UPDATE checks SET status=?,checked=?,expires=?,count=?,
+                          due=CASE WHEN failures>0 THEN MAX(due,?) ELSE ? END
+                          WHERE type='series' AND id=? AND parent=? AND checked<=?''',
+                          (*proof, due, due, target['id'], target['parent'], source['checked']))
+                        shared += cur.rowcount
+        return shared
+
+    def reconcile_alias_confirmations(self, policy, now=None):
+        """Repair pre-existing split alias evidence once per verified policy."""
+        now = time.time() if now is None else now
+        with self.lock:
+            if not policy or self.setting('policy') != policy:
+                raise ValueError('Alias reconciliation requires the current playback policy')
+            if self.setting('alias_reconciled_policy_v1') == policy:
+                return {'shared': 0, 'already_reconciled': True}
+            ids = [row[0] for row in self.db.execute('''SELECT DISTINCT c.id FROM checks c
+              WHERE c.type='series' AND c.status IN ('available','unavailable') AND c.expires>?
+              AND EXISTS(SELECT 1 FROM checks other WHERE other.type=c.type AND other.id=c.id AND other.parent!=c.parent)''',
+              (now + 60,))]
+            try:
+                shared = self._share_alias_checks(ids, now)
+                self.db.execute("INSERT OR REPLACE INTO settings VALUES ('alias_reconciled_policy_v1',?)", (encode(policy),))
+                self.db.commit()
+                return {'shared': shared, 'already_reconciled': False}
+            except Exception:
+                self.db.rollback()
+                raise
 
     def record(self, kind, ident, parent, verdict, count, now):
         with self.lock:
@@ -408,6 +589,8 @@ class Store:
                WHERE m.type=c.type AND m.id=c.parent AND cat.active=1)''', (kind, ident, parent)).fetchone()
             if row is None:
                 return
+            if verdict != 'error' and row['checked'] > now:
+                return  # An out-of-order result cannot replace newer evidence.
             if verdict == 'error':
                 failures = row['failures'] + 1
                 # A failure never extends an earlier positive confirmation.
@@ -417,6 +600,12 @@ class Store:
                 ttl = self.positive if verdict == 'available' else self.negative
                 self.db.execute('''UPDATE checks SET status=?,checked=?,expires=?,due=?,attempted=?,failures=0,count=?
                   WHERE type=? AND id=? AND parent=?''', (verdict, now, now + ttl, now + ttl * .8, now, count, kind, ident, parent))
+                if kind == 'series' and self.setting('policy'):
+                    try:
+                        self._share_alias_checks([ident], now)
+                    except Exception:
+                        self.db.rollback()
+                        raise
             self.db.commit()
 
     def recover_confirmations(self, snapshot, policy, digest, now=None):
@@ -618,7 +807,8 @@ class App:
     def __init__(self, options, path):
         self.o = options
         self.store = Store(path, options.get('positive_hours', 12) * 3600, options.get('negative_hours', 24) * 3600,
-                           options.get('max_episodes_per_series', 12))
+                           options.get('max_episodes_per_series', 12),
+                           catalog_refresh=options.get('catalog_refresh_hours', 6) * 3600)
         self.ready = False
         self.error = 'Initialising'
         self.provider_errors_visible = False
@@ -766,6 +956,8 @@ class App:
             if changed:
                 self.ready = False
             self.store.add_categories(catalogs, self.instance_id)
+            self.store.configure_crawl(self.o.get('max_candidates_per_category', 250),
+                                       self.o.get('catalog_refresh_hours', 6))
             if changed:
                 self.store.invalidate()
                 self.store.setting('policy', fingerprint)
@@ -788,6 +980,9 @@ class App:
                         raise ValueError('Invalid encoded recovery snapshot') from None
                     result=self.store.recover_confirmations(snapshot,fingerprint,digest)
                     print('Recovered '+str(result['restored'])+' still-valid confirmations',flush=True)
+            reconciled = self.store.reconcile_alias_confirmations(fingerprint)
+            if reconciled['shared']:
+                print('Reconciled ' + str(reconciled['shared']) + ' episode confirmations across explicit title aliases', flush=True)
             self.ready, self.error = True, None
             self.store.setting('last_sync', time.time())
 
@@ -828,7 +1023,9 @@ class App:
                     result = self.request(path, catalog=True)
                     if not isinstance(result.get('metas'), list):
                         raise ValueError('Invalid catalog response')
-                    self.store.add_page(cat, result['metas'], offset, self.o.get('max_candidates_per_category', 1000))
+                    if result.get('error'):
+                        raise ValueError('Upstream catalogue reported an error')
+                    self.store.add_page(cat, result['metas'], offset, self.o.get('max_candidates_per_category', 250))
                 except Exception as exc:
                     with self.store.lock:
                         self.store.db.execute('UPDATE categories SET done=1,refresh=? WHERE id=? AND active=1 AND generation=?',
@@ -1002,7 +1199,7 @@ class App:
         for kind in ('movie', 'series'):
             catalogs.append({'id': 'cached-search', 'type': kind, 'name': 'Available ' + kind + ' search',
                              'extra': [{'name': 'search', 'isRequired': True}, {'name': 'skip', 'isRequired': False}]})
-        return {'id': 'local.cached.media.library', 'version': '0.7.2', 'name': 'Cached Media Library',
+        return {'id': 'local.cached.media.library', 'version': '0.7.3', 'name': 'Cached Media Library',
                 'description': 'Recently verified cached streams matching your AIOStreams filters. Metadata only.',
                 'types': ['movie', 'series'],
                 'resources': ['catalog', {'name': 'meta', 'types': ['movie', 'series'], 'idPrefixes': ['tt', 'tmdb:']}],

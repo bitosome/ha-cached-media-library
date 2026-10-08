@@ -73,7 +73,10 @@ class RecoveryTests(unittest.TestCase):
     def test_recovery_never_overwrites_existing_conclusive_rows(self):
         # Even an older negative is retained by the deliberately conservative
         # pending-only import; recovery is not a second authority for live checks.
-        self.store.record('movie', 'tt1', 'tt1', 'unavailable', 0, 8500)
+        # Seed historical state directly: record() correctly refuses to replace
+        # the fixture's newer checked=9000 timestamp with an older live result.
+        self.store.db.execute("UPDATE checks SET status='unavailable',checked=8500,expires=15700,count=0 WHERE id='tt1'")
+        self.store.db.commit()
         self.assertEqual(self.restore()['restored'], 0)
         self.assertEqual(self.row()['status'], 'unavailable')
 

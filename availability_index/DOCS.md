@@ -59,6 +59,7 @@ URLs as credentials; avoid pasting them into public logs or issue reports.
 | `positive_hours` | Confirmation lifetime, 1–48 hours; default 12. Shorter lifetimes improve freshness but need more rechecks. |
 | `negative_hours` | Lifetime of a confirmed negative result, 1–168 hours; default 24. This does not apply to provider errors or unexplained empty responses. |
 | `max_candidates_per_category` | Upstream candidate depth per shelf, 20–5000; default 250. It is not a target number of verified results. |
+| `catalog_refresh_hours` | Refresh interval for completed source catalogues, 1–48 hours; default 6. Availability workers run continuously regardless of this interval. |
 | `max_episodes_per_series` | Progressive episode batch size, 1–100; default 12. All aired candidates remain eligible; this does not permanently cap visible episodes. |
 | `workers` | Concurrent availability workers, 1–6; default 2. They share the rate budget below. |
 | `metadata_workers` | Concurrent metadata fetches, 1–6; default 3. Long series can have large episode lists. |
@@ -133,6 +134,18 @@ Normal restarts and 0.7.1-to-0.7.2 upgrades retain existing confirmations.
 
 ## Shelves, genres and search
 
+Source catalogue crawling runs in the background. Increasing the configured depth
+immediately schedules paginated shelves for a fresh crawl, preserving existing
+memberships and availability confirmations while additional candidates are learned.
+Version 0.7.3 re-crawls existing active shelves once to establish the saved depth;
+ordinary synchronisation does not repeatedly restart a crawl.
+
+An empty upstream response can also mean a provider failure. It does not by itself
+remove existing members; the app retries after ten minutes if an empty response
+would shrink the shelf. This can retain earlier members when a source genuinely
+shrinks until a later complete, nonempty response confirms the change. Removing
+the catalogue from the source profile still retires that shelf explicitly.
+
 The source profile controls shelf names, order and candidate selection. Changes
 are reconciled during synchronisation. Removed shelves are retired; re-enabled
 shelves are crawled again. A completely empty upstream shelf is not published once
@@ -141,7 +154,11 @@ while checks are pending or when none of its candidates qualify.
 
 Genre options are published where source data supplies genres. Titles without
 genre metadata cannot be assigned reliably. Known IMDb/TMDB aliases are combined
-where metadata establishes that they identify the same title; translated names
+where metadata establishes that they identify the same title. Episode evidence
+is shared only between aliases with the same explicit IMDb identity and exact
+episode request ID; timestamps and expiry are preserved, and newer negatives win.
+This avoids losing confirmed episodes when the client sees a different alias.
+Translated names
 remain searchable across catalogue refreshes.
 
 Opening or searching for a known title advances its pending checks, with a
