@@ -63,7 +63,7 @@ class CatalogRefreshTests(unittest.TestCase):
         state = tuple(self.category())
         self.assertEqual(self.store.configure_crawl(400, 6), 0)
         self.assertEqual(tuple(self.category()), state)
-        self.assertEqual(self.store.setting('crawl_settings'), {'max_candidates': 400, 'refresh_hours': 6})
+        self.assertEqual(self.store.setting('crawl_settings'), {'max_candidates': 400, 'refresh_hours': 6, 'revision': ''})
 
     def test_completion_and_interval_changes_use_configured_refresh(self):
         self.store.configure_crawl(400, 1)

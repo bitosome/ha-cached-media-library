@@ -1,5 +1,5 @@
 name: Cached Media Library
-version: "0.7.3"
+version: "0.7.4"
 slug: availability_index
 description: Verified cached discovery and search for AIOStreams; read-only, never proxies video
 arch: [amd64, aarch64]
@@ -25,6 +25,7 @@ options:
   negative_hours: 24
   max_candidates_per_category: 250
   catalog_refresh_hours: 6
+  catalog_revision: ""
   max_episodes_per_series: 12
   workers: 2
   metadata_workers: 3
@@ -45,6 +46,7 @@ schema:
   negative_hours: int(1,168)
   max_candidates_per_category: int(20,5000)
   catalog_refresh_hours: int(1,48)
+  catalog_revision: str?
   max_episodes_per_series: int(1,100)
   workers: int(1,6)
   metadata_workers: int(1,6)

@@ -60,6 +60,7 @@ URLs as credentials; avoid pasting them into public logs or issue reports.
 | `negative_hours` | Lifetime of a confirmed negative result, 1–168 hours; default 24. This does not apply to provider errors or unexplained empty responses. |
 | `max_candidates_per_category` | Upstream candidate depth per shelf, 20–5000; default 250. It is not a target number of verified results. |
 | `catalog_refresh_hours` | Refresh interval for completed source catalogues, 1–48 hours; default 6. Availability workers run continuously regardless of this interval. |
+| `catalog_revision` | Optional manual marker, empty by default. Change it after saving source selection filters to request one fresh crawl of every active shelf. Unchanged values do not restart crawling. |
 | `max_episodes_per_series` | Progressive episode batch size, 1–100; default 12. All aired candidates remain eligible; this does not permanently cap visible episodes. |
 | `workers` | Concurrent availability workers, 1–6; default 2. They share the rate budget below. |
 | `metadata_workers` | Concurrent metadata fetches, 1–6; default 3. Long series can have large episode lists. |
@@ -133,6 +134,21 @@ records the snapshot digest atomically to prevent replay. Check `/status`'s
 Normal restarts and 0.7.1-to-0.7.2 upgrades retain existing confirmations.
 
 ## Shelves, genres and search
+
+After changing filters at an upstream catalogue provider, save those provider
+settings first, then set `catalog_revision` to a new marker such as
+`2026-10-08-selection-v1` and restart the app to load its updated options. The next
+synchronisation starts a new crawl for every active shelf, including curated lists.
+It retains current members and their confirmations until a complete new crawl can
+replace the shelf selection. The marker is manual: the app does not automatically
+detect upstream filter edits, and ordinary synchronisation with the same marker
+does not restart the crawl. Leaving it empty on upgrade does not add a migration
+crawl to an already configured index.
+
+This does not stage removal of catalogue IDs: removing a catalogue from the source
+manifest still retires it immediately. When replacing whole feeds, keep the old
+feeds enabled until their replacements have been crawled and verified, then remove
+the old feeds separately.
 
 Source catalogue crawling runs in the background. Increasing the configured depth
 immediately schedules paginated shelves for a fresh crawl, preserving existing

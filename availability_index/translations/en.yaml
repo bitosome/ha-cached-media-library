@@ -57,6 +57,13 @@ configuration:
       How often completed source catalogues are crawled again. Default 6, range
       1–48. Stream availability is checked continuously on its separate schedule.
       Increasing catalogue depth starts a fresh crawl without clearing confirmations.
+  catalog_revision:
+    name: Source catalogue revision (optional)
+    description: >-
+      Change this marker after saving upstream selection filters to request one
+      fresh crawl of every active shelf, including curated lists. For example,
+      2026-10-08-selection-v1. Existing confirmations are retained. Leave unchanged
+      during routine operation; upstream filter edits are not detected automatically.
   workers:
     name: Concurrent checks
     description: >-

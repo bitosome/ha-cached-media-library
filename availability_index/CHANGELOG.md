@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.4
+
+- Add optional `catalog_revision`, a manual marker for upstream selection changes.
+  Changing it re-crawls all active shelves once, including curated lists, while
+  retaining existing members and stream confirmations until the new crawl finishes.
+- Treat an absent saved revision as the empty default on upgrade, avoiding an
+  unnecessary crawl reset. Stale in-flight responses from the prior generation
+  cannot overwrite the refreshed selection.
+
 ## 0.7.3
 
 - Share episode availability evidence between explicitly matching IMDb/TMDB title

@@ -313,25 +313,32 @@ class Store:
                 self.db.execute('DELETE FROM titles WHERE NOT EXISTS (SELECT 1 FROM membership m WHERE m.type=titles.type AND m.id=titles.id)')
             self.db.commit()
 
-    def configure_crawl(self, cap, refresh_hours):
+    def configure_crawl(self, cap, refresh_hours, revision=''):
         """Apply crawl settings once without discarding membership or evidence.
 
         Old databases have no recorded depth: re-crawl their active shelves once.
         A depth change starts a new generation for paginated shelves, including
-        those previously marked complete, instead of waiting for tomorrow.
+        those previously marked complete, instead of waiting for tomorrow. A
+        manually changed source revision refreshes every active shelf, including
+        curated catalogues, without invalidating stream confirmations.
         """
-        settings = {'max_candidates': cap, 'refresh_hours': refresh_hours}
+        settings = {'max_candidates': cap, 'refresh_hours': refresh_hours, 'revision': revision or ''}
         with self.lock:
             previous = self.setting('crawl_settings')
             self.catalog_refresh = refresh_hours * 3600
+            if isinstance(previous, dict) and 'revision' not in previous:
+                # Upgrading without explicitly setting a revision must not start
+                # a second migration crawl on an otherwise configured index.
+                previous = dict(previous, revision='')
             if previous == settings:
                 return 0
             legacy = not isinstance(previous, dict) or 'max_candidates' not in previous
             depth_changed = legacy or previous['max_candidates'] != cap
+            revision_changed = not legacy and previous['revision'] != settings['revision']
             restarted = 0
             for cat in self.db.execute('SELECT * FROM categories WHERE active=1').fetchall():
                 paginated = any(e.get('name') == 'skip' for e in json.loads(cat['extra']))
-                if legacy or (depth_changed and paginated):
+                if legacy or revision_changed or (depth_changed and paginated):
                     self.db.execute('''UPDATE categories SET offset=0,done=0,refresh=0,
                       generation=generation+1 WHERE id=?''', (cat['id'],))
                     restarted += 1
@@ -957,7 +964,8 @@ class App:
                 self.ready = False
             self.store.add_categories(catalogs, self.instance_id)
             self.store.configure_crawl(self.o.get('max_candidates_per_category', 250),
-                                       self.o.get('catalog_refresh_hours', 6))
+                                       self.o.get('catalog_refresh_hours', 6),
+                                       self.o.get('catalog_revision', ''))
             if changed:
                 self.store.invalidate()
                 self.store.setting('policy', fingerprint)
@@ -1199,7 +1207,7 @@ class App:
         for kind in ('movie', 'series'):
             catalogs.append({'id': 'cached-search', 'type': kind, 'name': 'Available ' + kind + ' search',
                              'extra': [{'name': 'search', 'isRequired': True}, {'name': 'skip', 'isRequired': False}]})
-        return {'id': 'local.cached.media.library', 'version': '0.7.3', 'name': 'Cached Media Library',
+        return {'id': 'local.cached.media.library', 'version': '0.7.4', 'name': 'Cached Media Library',
                 'description': 'Recently verified cached streams matching your AIOStreams filters. Metadata only.',
                 'types': ['movie', 'series'],
                 'resources': ['catalog', {'name': 'meta', 'types': ['movie', 'series'], 'idPrefixes': ['tt', 'tmdb:']}],
