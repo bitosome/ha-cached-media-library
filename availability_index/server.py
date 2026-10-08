@@ -27,6 +27,8 @@ from urllib.error import HTTPError
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 from urllib.request import Request, urlopen
 
+from tmdb_discovery import TMDBDiscovery
+
 # Include new/unknown settings conservatively. An allow-list of a few filters
 # missed language, resolution, size and provider changes and kept stale verdicts.
 # Only known presentation, identity and catalogue-only settings are excluded.
@@ -185,6 +187,7 @@ class Store:
           CREATE TABLE IF NOT EXISTS titles (type TEXT,id TEXT,preview TEXT,meta TEXT,search TEXT,meta_due REAL DEFAULT 0,meta_checked REAL DEFAULT 0,priority INTEGER DEFAULT 9999,rank INTEGER DEFAULT 999999,meta_claimed REAL DEFAULT 0,PRIMARY KEY(type,id));
           CREATE TABLE IF NOT EXISTS membership (category TEXT,type TEXT,id TEXT,rank INTEGER,seen REAL DEFAULT 0,PRIMARY KEY(category,type,id));
           CREATE TABLE IF NOT EXISTS checks (type TEXT,id TEXT,parent TEXT,status TEXT DEFAULT 'pending',checked REAL DEFAULT 0,expires REAL DEFAULT 0,due REAL DEFAULT 0,attempted REAL DEFAULT 0,failures INTEGER DEFAULT 0,count INTEGER DEFAULT 0,priority INTEGER DEFAULT 0,PRIMARY KEY(type,id,parent));
+          CREATE TABLE IF NOT EXISTS tmdb_ids (kind TEXT,tmdb_id INTEGER,imdb_id TEXT,expires REAL NOT NULL,PRIMARY KEY(kind,tmdb_id));
           CREATE INDEX IF NOT EXISTS due_checks ON checks(due,priority);
           CREATE INDEX IF NOT EXISTS parent_checks ON checks(type,parent,status,expires);
           CREATE INDEX IF NOT EXISTS title_memberships ON membership(type,id);
@@ -276,6 +279,90 @@ class Store:
             self.db.execute("UPDATE checks SET status='pending',expires=0,due=0,attempted=0")
             self.db.commit()
 
+    @staticmethod
+    def _tmdb_identity_key(kind, tmdb_id):
+        if kind not in ('movie', 'series') or isinstance(tmdb_id, bool):
+            raise ValueError('Invalid TMDB identity')
+        if not isinstance(tmdb_id, (str, int)) or not re.fullmatch(r'[1-9]\d*', str(tmdb_id)):
+            raise ValueError('Invalid TMDB identity')
+        value = int(tmdb_id)
+        if value > 9223372036854775807:
+            raise ValueError('Invalid TMDB identity')
+        return kind, value
+
+    def get_tmdb_identity(self, kind, tmdb_id, now):
+        """Return fresh cached identity, including an explicit absent IMDb id.
+
+        None means a cache miss; a row with imdb_id=None means the TMDB API
+        authoritatively reported no IMDb mapping. Availability policy is unrelated
+        to these identifiers and invalidating stream evidence leaves them intact.
+        """
+        key = self._tmdb_identity_key(kind, tmdb_id)
+        with self.lock:
+            row = self.db.execute('SELECT * FROM tmdb_ids WHERE kind=? AND tmdb_id=? AND expires>?',
+                                  (*key, now)).fetchone()
+            return dict(row) if row else None
+
+    def set_tmdb_identity(self, kind, tmdb_id, imdb_id, expires):
+        key = self._tmdb_identity_key(kind, tmdb_id)
+        if imdb_id is not None and (not isinstance(imdb_id, str) or not re.fullmatch(r'tt\d+', imdb_id)):
+            raise ValueError('Invalid IMDb identity')
+        if (isinstance(expires, bool) or not isinstance(expires, (int, float))
+                or not math.isfinite(expires) or expires <= 0):
+            raise ValueError('Invalid identity expiration')
+        with self.lock:
+            self.db.execute('''INSERT INTO tmdb_ids VALUES (?,?,?,?) ON CONFLICT(kind,tmdb_id)
+              DO UPDATE SET imdb_id=excluded.imdb_id,expires=excluded.expires''', (*key, imdb_id, expires))
+            self.db.commit()
+
+    def seed_tmdb_identities(self, now, ttl=604800):
+        """Seed explicit, unambiguous existing pairs once; never renew their age.
+
+        Existing mappings (including authoritative missing ids) always win. Both
+        conflicting documents within one title and conflicts across title aliases
+        prevent seeding, so upstream resolution decides ambiguous cases.
+        """
+        with self.lock:
+            if self.setting('tmdb_identity_seed_v1') is not None:
+                return 0
+            candidates = {}
+            blocked = set()
+            for row in self.db.execute('SELECT type,id,preview,meta FROM titles'):
+                try:
+                    documents = [json.loads(row['preview']), json.loads(row['meta'] or '{}')]
+                    if not all(isinstance(d, dict) for d in documents):
+                        continue
+                    ids = set()
+                    for value in [row['id']] + [d.get('id') for d in documents]:
+                        if isinstance(value, str) and re.fullmatch(r'tmdb:[1-9]\d*', value):
+                            ids.add(int(value.split(':', 1)[1]))
+                    for document in documents:
+                        values = [document.get('tmdbId'), document.get('tmdb_id')]
+                        providers = document.get('providerIds') or document.get('ProviderIds') or {}
+                        if isinstance(providers, dict):
+                            values.extend(providers.get(k) for k in ('Tmdb', 'tmdb', 'TMDB'))
+                        for value in values:
+                            if value is not None:
+                                ids.add(self._tmdb_identity_key(row['type'], value)[1])
+                    imdb = self._explicit_imdb(documents[0], documents[1], row['id'])
+                except (ValueError, TypeError, AttributeError):
+                    continue
+                keys = {(row['type'], ident) for ident in ids}
+                if len(keys) != 1 or imdb is None:
+                    blocked.update(keys)
+                    continue
+                key = next(iter(keys))
+                candidates.setdefault(key, set()).add(imdb)
+            added = 0
+            for key, imdb_ids in candidates.items():
+                if key not in blocked and len(imdb_ids) == 1:
+                    cur = self.db.execute('INSERT OR IGNORE INTO tmdb_ids VALUES (?,?,?,?)',
+                                          (*key, next(iter(imdb_ids)), now + ttl))
+                    added += cur.rowcount
+            self.db.execute("INSERT OR REPLACE INTO settings VALUES ('tmdb_identity_seed_v1',?)", (encode(now),))
+            self.db.commit()
+            return added
+
     def add_categories(self, catalogs, instance_id):
         """Reconcile the published shelves with the catalogue source. The source is a
         dedicated profile that is never switched over, so its manifest is authoritative:
@@ -357,12 +444,31 @@ class Store:
             self.db.commit()
             return restarted
 
-    def add_page(self, cat, previews, offset, cap):
+    def add_page(self, cat, previews, offset, cap, complete=False, next_offset=None):
+        """Apply a page, optionally with authoritative completion/raw cursor.
+
+        Native discovery validates the source response before setting complete or
+        providing next_offset. That cursor counts source candidates, even when
+        local filtering leaves fewer previews. Legacy Stremio empty responses
+        remain ambiguous and cannot retire unseen membership.
+        """
+        if (isinstance(offset, bool) or not isinstance(offset, int) or offset < 0
+                or isinstance(cap, bool) or not isinstance(cap, int) or cap < 1 or offset > cap
+                or not isinstance(complete, bool) or not isinstance(previews, list)):
+            raise ValueError('Invalid catalogue pagination')
+        explicit_cursor = next_offset is not None
+        if explicit_cursor and (isinstance(next_offset, bool) or not isinstance(next_offset, int)
+                                or next_offset < offset + len(previews)
+                                or (next_offset <= offset and not complete and offset < cap)):
+            raise ValueError('Invalid catalogue cursor')
+        cursor = min(cap, next_offset if explicit_cursor else offset + len(previews))
         with self.lock:
-            current = self.db.execute('SELECT active,generation FROM categories WHERE id=?', (cat['id'],)).fetchone()
+            current = self.db.execute('SELECT active,generation,offset,done FROM categories WHERE id=?', (cat['id'],)).fetchone()
             if current is None or not current['active'] or current['generation'] != cat['generation']:
                 # A response may arrive after the category was removed/restored or
                 # after another crawl started. It must not revive obsolete members.
+                return False
+            if (explicit_cursor or complete) and offset != (0 if current['done'] else current['offset']):
                 return False
             remaining = max(0, cap - offset)
             if remaining == 0:
@@ -381,7 +487,7 @@ class Store:
             previews = previews[:remaining]
             if any(not isinstance(p, dict) or not isinstance(p.get('id'), str) or not p['id'] for p in previews):
                 raise ValueError('Invalid catalogue preview')
-            if not previews:
+            if not previews and not complete and not explicit_cursor:
                 # AIOStreams can return an empty list after a provider failure.
                 # Never use that alone to remove previously indexed membership.
                 # An empty end page is safe to finish when every old member was
@@ -423,11 +529,11 @@ class Store:
                 if kind == 'movie':
                     self.db.execute('INSERT OR IGNORE INTO checks(type,id,parent,priority) VALUES (?,?,?,?)', (kind, ident, ident, shelf))
             skip = any(e.get('name') == 'skip' for e in json.loads(cat['extra']))
-            done = not previews or (offset > 0 and not new) or not skip or offset + len(previews) >= cap
+            done = complete or (not explicit_cursor and offset > 0 and not new) or not skip or cursor >= cap
             if done:
                 self.db.execute('DELETE FROM membership WHERE category=? AND seen!=?', (cat['id'], generation))
             self.db.execute('UPDATE categories SET offset=?,done=?,refresh=? WHERE id=?',
-                            (offset + len(previews), int(done), time.time() + self.catalog_refresh if done else 0, cat['id']))
+                            (cursor, int(done), time.time() + self.catalog_refresh if done else 0, cat['id']))
             self.db.commit()
             return True
 
@@ -720,7 +826,17 @@ class Store:
                 if canonical in seen:
                     continue
                 seen.add(canonical)
+                # Native discovery supplies fresh selection/title fields while
+                # the original metadata provider supplies richer presentation.
+                # Only fill display fields: copying the complete metadata could
+                # expose unverified episode lists or change the playable identity.
+                for field in ('logo', 'poster', 'background', 'landscapePoster', 'fanart',
+                              'imdbRating', 'runtime', 'cast', 'director', 'writer',
+                              'description', 'releaseInfo'):
+                    if preview.get(field) in (None, '', []) and meta.get(field) not in (None, '', []):
+                        preview[field] = meta[field]
                 preview.pop('videos', None)
+                preview.pop('streams', None)
                 preview['genres'] = genres
                 result.append(preview)
             return result[max(0, skip):max(0, skip) + 100]
@@ -816,6 +932,19 @@ class App:
         self.store = Store(path, options.get('positive_hours', 12) * 3600, options.get('negative_hours', 24) * 3600,
                            options.get('max_episodes_per_series', 12),
                            catalog_refresh=options.get('catalog_refresh_hours', 6) * 3600)
+        raw_catalogs = options.get('tmdb_catalogs') or '[]'
+        try:
+            catalogs = json.loads(raw_catalogs) if isinstance(raw_catalogs, str) else raw_catalogs
+        except (TypeError, ValueError):
+            raise ValueError('tmdb_catalogs must be a JSON array') from None
+        if not isinstance(catalogs, list):
+            raise ValueError('tmdb_catalogs must be a JSON array')
+        self.tmdb = None
+        if catalogs:
+            self.tmdb = TMDBDiscovery(options.get('tmdb_api_key', ''), catalogs,
+                                      language=options.get('tmdb_language', 'en-US'),
+                                      resolve_identity=self.resolve_tmdb_identity)
+            self.store.seed_tmdb_identities(time.time())
         self.ready = False
         self.error = 'Initialising'
         self.provider_errors_visible = False
@@ -842,6 +971,15 @@ class App:
         self.o['endpoint_token'] = self.resolve_token(options.get('endpoint_token'))
         if self.catalog_source is None:
             self.catalog_source = self.source
+
+    def resolve_tmdb_identity(self, kind, tmdb_id):
+        now = time.time()
+        cached = self.store.get_tmdb_identity(kind, tmdb_id, now)
+        if cached is not None:
+            return cached['imdb_id']
+        imdb = self.tmdb.external_id(kind, tmdb_id)
+        self.store.set_tmdb_identity(kind, tmdb_id, imdb, now + (604800 if imdb else 86400))
+        return imdb
 
     def stremio(self, uuid, encrypted):
         if not uuid or not encrypted:
@@ -887,9 +1025,21 @@ class App:
 
     def upstream_catalogs(self):
         manifest = self.request('/manifest.json', catalog=True)
+        if (not isinstance(manifest, dict) or manifest.get('error') or manifest.get('errors')
+                or not isinstance(manifest.get('catalogs'), list) or not manifest['catalogs']
+                or any(not isinstance(c, dict) for c in manifest['catalogs'])):
+            # Local catalogues must not mask a failed/empty source manifest and
+            # accidentally retire curated shelves or their sole confirmations.
+            raise ValueError('Invalid or empty source catalogue manifest')
         if any(is_scanner_catalog(c.get('id', ''), self.instance_id) for c in manifest.get('catalogs', [])):
             raise ValueError('The original catalogue profile must not include Cached Media Library')
         catalogs = [c for c in manifest.get('catalogs', []) if self.is_upstream(c)]
+        if self.tmdb:
+            # Definitions are local and remain available even if TMDB is down.
+            # Reuse source IDs so Infuse libraries and confirmations survive.
+            local = self.tmdb.manifest_catalogs()
+            keys = {(c['type'], c['id']) for c in local}
+            catalogs = local + [c for c in catalogs if (c['type'], c['id']) not in keys]
         return catalogs
 
     def pace_stream(self):
@@ -965,7 +1115,7 @@ class App:
             self.store.add_categories(catalogs, self.instance_id)
             self.store.configure_crawl(self.o.get('max_candidates_per_category', 250),
                                        self.o.get('catalog_refresh_hours', 6),
-                                       self.o.get('catalog_revision', ''))
+                                       self.crawl_revision())
             if changed:
                 self.store.invalidate()
                 self.store.setting('policy', fingerprint)
@@ -993,6 +1143,15 @@ class App:
                 print('Reconciled ' + str(reconciled['shared']) + ' episode confirmations across explicit title aliases', flush=True)
             self.ready, self.error = True, None
             self.store.setting('last_sync', time.time())
+
+    def crawl_revision(self):
+        revision = self.o.get('catalog_revision', '')
+        if self.tmdb:
+            # Filter edits trigger one refresh, never invalidate stream proofs.
+            selection = {'catalogs': self.o['tmdb_catalogs'],
+                         'language': self.o.get('tmdb_language', 'en-US')}
+            return revision + ':tmdb:' + hashlib.sha256(encode(selection).encode()).hexdigest()
+        return revision
 
     def sync_loop(self):
         while not self.stop.is_set():
@@ -1028,12 +1187,17 @@ class App:
                 path = '/catalog/' + cat['type'] + '/' + quote(cat['upstream'], safe='')
                 path += ('/skip=' + str(offset) if offset else '') + '.json'
                 try:
-                    result = self.request(path, catalog=True)
+                    native = self.tmdb and self.tmdb.has_catalog(cat['type'], cat['upstream'])
+                    result = (self.tmdb.catalog(cat['type'], cat['upstream'], offset) if native
+                              else self.request(path, catalog=True))
                     if not isinstance(result.get('metas'), list):
                         raise ValueError('Invalid catalog response')
                     if result.get('error'):
                         raise ValueError('Upstream catalogue reported an error')
-                    self.store.add_page(cat, result['metas'], offset, self.o.get('max_candidates_per_category', 250))
+                    self.store.add_page(cat, result['metas'], offset,
+                                        self.o.get('max_candidates_per_category', 250),
+                                        **({'complete': result['complete'], 'next_offset': result['next_offset']}
+                                           if native else {}))
                 except Exception as exc:
                     with self.store.lock:
                         self.store.db.execute('UPDATE categories SET done=1,refresh=? WHERE id=? AND active=1 AND generation=?',
@@ -1207,7 +1371,7 @@ class App:
         for kind in ('movie', 'series'):
             catalogs.append({'id': 'cached-search', 'type': kind, 'name': 'Available ' + kind + ' search',
                              'extra': [{'name': 'search', 'isRequired': True}, {'name': 'skip', 'isRequired': False}]})
-        return {'id': 'local.cached.media.library', 'version': '0.7.4', 'name': 'Cached Media Library',
+        return {'id': 'local.cached.media.library', 'version': '0.8.0', 'name': 'Cached Media Library',
                 'description': 'Recently verified cached streams matching your AIOStreams filters. Metadata only.',
                 'types': ['movie', 'series'],
                 'resources': ['catalog', {'name': 'meta', 'types': ['movie', 'series'], 'idPrefixes': ['tt', 'tmdb:']}],
@@ -1265,6 +1429,8 @@ class Handler(BaseHTTPRequestHandler):
         if path in ('/', '/health', '/status'):
             status = {'ready': app.ready, 'issue': app.error, 'last_policy_sync': app.store.setting('last_sync'),
                       'recovery': app.store.setting('last_recovery'),
+                      'discovery': {'provider': 'direct-tmdb' if app.tmdb else 'source-profile',
+                                    'local_catalogs': len(app.tmdb.manifest_catalogs()) if app.tmdb else 0},
                       'worker_errors': app.worker_errors,
                       'workers_alive': {k: v.is_alive() for k,v in app.threads.items()},
                       'worker_ages': {k: round(time.time() - v) for k, v in app.heartbeats.items()}, **app.store.status()}

@@ -28,7 +28,8 @@ configuration, need administrator credentials, store stream URLs, or proxy video
 
 1. It reads the playback profile to confirm cached-only filtering remains enforced.
    Changes to settings that affect stream acceptance invalidate stored verdicts.
-2. It learns catalogues and complete metadata from the separate source profile.
+2. It builds configured discovery catalogues directly from TMDB, and reads other
+   catalogues and complete metadata from the separate source profile.
    Keeping metadata independent prevents filtered episode lists feeding back into
    the scanner.
 3. It checks candidates against the playback profile's `/stream` endpoint.
@@ -45,14 +46,15 @@ the indexed candidates; it is not a search of everything cached by the provider.
 
 ## Shelves
 
-The separate source profile controls shelf names and order. Add, remove, rename or
+Local TMDB definitions and the separate source profile control shelves. Add, remove, rename or
 reorder its catalogues, and the app reconciles them on the next synchronisation.
 Removed shelves are retired. Re-enabled shelves are scheduled for a fresh crawl.
 
-A useful line-up includes recent releases, trending titles, sci-fi and fantasy,
-genre shelves, and curated family selections such as Лучшие мультсериалы,
-Советские мультфильмы and Лучшие фильмы. The app does not curate those lists itself.
-It publishes available candidates from the source profile.
+A useful line-up includes best movies and series, recent releases, sci-fi and
+fantasy, animation, and curated family favourites. Optional direct TMDB discovery
+uses your API key and local selection definitions instead of a hosted Discover
+service. See [configuration and migration](availability_index/DOCS.md#direct-tmdb-discovery-080).
+Only candidates with acceptable cached streams are published.
 
 Set AIOStreams `jellyfin.maxLibraries` high enough for the published shelf count.
 Source shelves refresh every six hours by default (`catalog_refresh_hours`);

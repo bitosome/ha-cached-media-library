@@ -48,6 +48,9 @@ URLs as credentials; avoid pasting them into public logs or issue reports.
 
 | Option | Description |
 | --- | --- |
+| `tmdb_api_key` | Optional TMDB v3 API key or Read Access Token for direct discovery. |
+| `tmdb_language` | Metadata language for direct discovery; default `en-US`. |
+| `tmdb_catalogs` | JSON array of local catalogue definitions; default `[]` disables direct discovery. |
 | `aiostreams_url` | AIOStreams base URL, for example `http://192.168.0.13:3000`. |
 | `active_uuid` | Playback profile UUID, used read-only to verify its filters. |
 | `active_password` | Playback profile configuration password, not dashboard administrator password. |
@@ -68,6 +71,53 @@ URLs as credentials; avoid pasting them into public logs or issue reports.
 | `check_delay_seconds` | Additional pause after each worker's check, 0–10 seconds; default 1.5. Lowering it does not bypass shared pacing. |
 | `recovery_snapshot` | Leave empty normally. Optional administrator-supplied snapshot for one-time recovery of still-valid confirmations; see recovery below. |
 | `scanner_instance_id` | This app's custom-preset `instanceId` in AIOStreams; default `cachedlibrary`. Used to identify and avoid its own resources. |
+
+## Direct TMDB discovery (0.8.0)
+
+Discovery can run inside this app against the official `api.themoviedb.org` API.
+No hosted TMDB Discover service is required. Set `tmdb_api_key` to your TMDB v3
+key or API Read Access Token, `tmdb_language` to a metadata language such as
+`en-US`, and `tmdb_catalogs` to a JSON array of catalogue definitions:
+
+```json
+[{"id":"local-best-movies","type":"movie","name":"Best Movies","filters":{"listType":"discover","sortBy":"vote_average.desc","ratingMin":7,"voteCountMin":500,"includeAdult":false,"releasedOnly":true,"releaseTypes":[1,2,3,4,5,6]}}]
+```
+
+Each definition has a stable `id`, `type` (`movie` or `series`), `name` and
+`filters`. Selection supports genre IDs, excluded genres, rating/vote thresholds,
+released-only date cutoffs, sorting and scripted/miniseries filters. For scripted series use
+`tvType: "2|4"` and `excludeGenres: [10763,10764,10767]`. Genre `16` selects
+animation; it is not an age rating. Language affects metadata, not the language
+of available audio. Russian/English audio preferences remain in AIOStreams.
+
+Keep catalogue IDs unchanged when editing filters. The app detects changes to
+local definitions or metadata language and starts one new crawl while retaining
+existing confirmations. Only candidates passing the normal AIOStreams checks
+are published. Direct TMDB paging has an explicit completion signal, so a
+successfully completed shorter or empty selection removes obsolete members.
+Transport errors, rate limits and invalid responses retain membership for retry.
+
+**Migrating an existing hosted discovery provider:** use each catalogue's exact
+source-profile ID, including its AIOStreams prefix, and keep its original type.
+This preserves the derived Infuse shelf IDs. Enable and verify direct discovery
+before removing the hosted catalogue preset from the source profile. The app
+prefers local definitions for those IDs. Existing explicit TMDB/IMDb mappings
+seed a persistent cache; new mappings are resolved directly from TMDB. Mapping
+cache entries do not establish stream availability or extend confirmations.
+
+The separate source profile is still required for complete episode metadata and
+any other catalogues, including curated family selections. Its metadata provider
+must remain enabled; replacing discovery does not replace every AIOStreams
+metadata or stream provider. Do not add the filtered cache app to that profile.
+
+Leave `tmdb_catalogs` as `[]` to retain the previous source-profile-only mode.
+The TMDB key stays in Home Assistant app options and is sent only to the official
+TMDB API. It is not published in the manifest, status response or catalogue output.
+TMDB requests are paced separately from TorBox availability checks. Positive ID
+mappings last seven days, confirmed missing IMDb mappings one day. No media is
+served through this app.
+
+This product uses the TMDB API but is not endorsed or certified by TMDB.
 
 ## Installation and switch-over
 

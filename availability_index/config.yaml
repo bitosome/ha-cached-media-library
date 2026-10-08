@@ -1,5 +1,5 @@
 name: Cached Media Library
-version: "0.7.4"
+version: "0.8.0"
 slug: availability_index
 description: Verified cached discovery and search for AIOStreams; read-only, never proxies video
 arch: [amd64, aarch64]
@@ -33,6 +33,9 @@ options:
   stream_requests_per_minute: 30
   scanner_instance_id: cachedlibrary
   recovery_snapshot: ""
+  tmdb_api_key: ""
+  tmdb_language: en-US
+  tmdb_catalogs: "[]"
 schema:
   aiostreams_url: url
   active_uuid: str
@@ -54,3 +57,6 @@ schema:
   stream_requests_per_minute: int(1,600)
   scanner_instance_id: str(1,32)
   recovery_snapshot: password?
+  tmdb_api_key: password?
+  tmdb_language: str?
+  tmdb_catalogs: str?

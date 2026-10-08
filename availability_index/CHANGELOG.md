@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.0
+
+- Run configured discovery catalogues directly against TMDB without a hosted Discover service.
+- Preserve shelf and IMDb title IDs during migration, with a persistent TMDB/IMDb mapping cache.
+- Detect local selection changes and refresh without discarding availability confirmations.
+- Use validated direct-API pagination to remove stale members when a catalogue shrinks, while preserving results on errors.
+- Keep cached-only stream checks, complete source metadata, and direct debrid playback unchanged.
+
 ## 0.7.4
 
 - Add optional `catalog_revision`, a manual marker for upstream selection changes.

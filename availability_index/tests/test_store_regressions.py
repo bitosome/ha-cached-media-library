@@ -93,6 +93,47 @@ class StoreRegressionTests(unittest.TestCase):
         self.assertTrue(self.add('movie', {'id': 'ttnew', 'name': 'New'}))
         self.assertIsNone(self.store.db.execute("SELECT id FROM titles WHERE id='ttghost'").fetchone())
 
+    def test_basic_discovery_refresh_retains_presentation_without_leaking_playback_metadata(self):
+        self.add('series', {'id': 'tmdb:1', 'name': 'Original preview'})
+        metadata = {'id': 'tt1', 'type': 'series', 'name': 'Metadata title',
+                    'logo': 'https://images.invalid/logo.png', 'poster': 'https://images.invalid/old.jpg',
+                    'imdbRating': '8.9', 'runtime': '45 min', 'cast': ['Actor One'],
+                    'director': ['Director One'], 'writer': ['Writer One'],
+                    'releaseInfo': '2020–', 'description': 'Full metadata description',
+                    'videos': self.videos(count=2), 'behaviorHints': {'defaultVideoId': 'tt1:1:2'},
+                    'streams': [{'url': 'https://video.invalid/unverified'}]}
+        self.store.save_meta('series', 'tmdb:1', metadata, self.now)
+        self.store.record('series', 'tt1:1:1', 'tmdb:1', 'available', 1, self.now)
+        proofs = [tuple(row) for row in self.store.db.execute('SELECT * FROM checks ORDER BY id')]
+        self.add('series', {'id': 'tmdb:1', 'type': 'series', 'name': 'Fresh native title',
+                            'poster': 'https://images.invalid/fresh.jpg', 'vote_average': 7.3,
+                            'description': 'Fresh native description', 'genres': ['Animation']})
+        result = self.store.catalog('series', self.category('series')['id'], now=self.now + 1)
+        self.assertEqual(len(result), 1)
+        preview = result[0]
+        self.assertEqual((preview['id'], preview['type'], preview['name']),
+                         ('tmdb:1', 'series', 'Fresh native title'))
+        self.assertEqual(preview['imdbRating'], '8.9')
+        self.assertNotEqual(float(preview['imdbRating']), preview['vote_average'])
+        self.assertEqual(preview['logo'], metadata['logo'])
+        self.assertEqual(preview['poster'], 'https://images.invalid/fresh.jpg')
+        self.assertEqual(preview['description'], 'Fresh native description')
+        for field in ('runtime', 'cast', 'director', 'writer', 'releaseInfo'):
+            self.assertEqual(preview[field], metadata[field])
+        for field in ('videos', 'streams', 'behaviorHints'):
+            self.assertNotIn(field, preview)
+        self.assertEqual([tuple(row) for row in self.store.db.execute('SELECT * FROM checks ORDER BY id')], proofs)
+        self.assertEqual([v['id'] for v in self.store.meta('series', 'tmdb:1', self.now + 1)['videos']], ['tt1:1:1'])
+        self.assertEqual(self.store.catalog('series', self.category('series')['id'], now=self.now + 3601), [])
+
+    def test_tmdb_score_is_never_substituted_for_absent_imdb_score(self):
+        self.add('movie', {'id': 'tt1', 'name': 'Native movie', 'vote_average': 8.2})
+        self.store.save_meta('movie', 'tt1', {'id': 'tt1', 'logo': 'https://images.invalid/logo.png'}, self.now)
+        self.store.record('movie', 'tt1', 'tt1', 'available', 1, self.now)
+        preview = self.store.catalog('movie', self.category('movie')['id'], now=self.now + 1)[0]
+        self.assertEqual(preview['vote_average'], 8.2)
+        self.assertNotIn('imdbRating', preview)
+
     def test_prior_crawl_generation_cannot_override_a_newer_page(self):
         snapshot = self.category('movie')
         self.assertTrue(self.store.add_page(snapshot, [{'id': 'tt1', 'name': 'Current'}], 0, 1000))

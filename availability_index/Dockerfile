@@ -13,7 +13,7 @@ LABEL \
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
-COPY server.py /app/server.py
+COPY server.py tmdb_discovery.py /app/
 EXPOSE 8097
 
 # /health answers 503 until the index has synchronised with AIOStreams.

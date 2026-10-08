@@ -1,4 +1,20 @@
 configuration:
+  tmdb_api_key:
+    name: TMDB API key or Read Access Token
+    description: >-
+      Optional credential for discovery directly from the official TMDB API.
+      Required when local TMDB catalogues are configured.
+  tmdb_language:
+    name: TMDB metadata language
+    description: >-
+      Metadata language such as en-US. Does not restrict audio language;
+      audio preferences remain in the AIOStreams playback profile.
+  tmdb_catalogs:
+    name: Local TMDB catalogue definitions (JSON)
+    description: >-
+      JSON array of stable id, type, name and filters objects. See documentation
+      for examples. Keep IDs unchanged to preserve Infuse shelves. Changes
+      schedule one new crawl while retaining cache confirmations. [] disables it.
   aiostreams_url:
     name: AIOStreams base URL
     description: >-
