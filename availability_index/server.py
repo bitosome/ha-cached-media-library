@@ -867,6 +867,21 @@ class Store:
             if not row:
                 return None
             meta = json.loads(row['meta'] or row['preview'])
+            # Providers may answer an IMDb request with a TMDB parent id (or
+            # vice versa). Jellyfin derives season ids from this field, so the
+            # outgoing parent must match the indexed/search id. Retain the
+            # provider alias explicitly; episode request ids and stored evidence
+            # remain untouched.
+            original = meta.get('id', '')
+            ids = meta.get('ids') if isinstance(meta.get('ids'), dict) else {}
+            if isinstance(original, str) and original != ident:
+                if re.fullmatch(r'tmdb:[1-9]\d*', original):
+                    if not ids.get('tmdb') and not any(meta.get(k) for k in ('tmdb_id', '_tmdbId', 'moviedb_id')):
+                        meta['tmdb_id'] = original.split(':', 1)[1]
+                elif re.fullmatch(r'tt\d+', original):
+                    if not ids.get('imdb') and not any(meta.get(k) for k in ('imdb_id', '_imdbId')):
+                        meta['imdb_id'] = original
+            meta['id'] = ident
             if kind == 'series':
                 allowed = {r[0] for r in self.db.execute("SELECT id FROM checks WHERE type=? AND parent=? AND status='available' AND expires>?", (kind, ident, now + 60))}
                 meta['videos'] = [v for v in meta.get('videos', []) if v.get('id') in allowed and aired(v, now)]
@@ -1371,7 +1386,7 @@ class App:
         for kind in ('movie', 'series'):
             catalogs.append({'id': 'cached-search', 'type': kind, 'name': 'Available ' + kind + ' search',
                              'extra': [{'name': 'search', 'isRequired': True}, {'name': 'skip', 'isRequired': False}]})
-        return {'id': 'local.cached.media.library', 'version': '0.8.1', 'name': 'Cached Media Library',
+        return {'id': 'local.cached.media.library', 'version': '0.8.2', 'name': 'Cached Media Library',
                 'description': 'Recently verified cached streams matching your AIOStreams filters. Metadata only.',
                 'types': ['movie', 'series'],
                 'resources': ['catalog', {'name': 'meta', 'types': ['movie', 'series'], 'idPrefixes': ['tt', 'tmdb:']}],

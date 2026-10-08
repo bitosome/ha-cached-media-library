@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.2
+
+- Keep metadata parent IDs consistent with catalogue and search IDs so Infuse season requests return the verified episodes.
+- Preserve upstream IMDb/TMDB aliases explicitly without changing episode stream IDs, stored metadata or cache confirmations.
+
 ## 0.8.1
 
 - Add rolling release windows for honest recent-movie and series-premiere categories.
