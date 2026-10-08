@@ -1371,7 +1371,7 @@ class App:
         for kind in ('movie', 'series'):
             catalogs.append({'id': 'cached-search', 'type': kind, 'name': 'Available ' + kind + ' search',
                              'extra': [{'name': 'search', 'isRequired': True}, {'name': 'skip', 'isRequired': False}]})
-        return {'id': 'local.cached.media.library', 'version': '0.8.0', 'name': 'Cached Media Library',
+        return {'id': 'local.cached.media.library', 'version': '0.8.1', 'name': 'Cached Media Library',
                 'description': 'Recently verified cached streams matching your AIOStreams filters. Metadata only.',
                 'types': ['movie', 'series'],
                 'resources': ['catalog', {'name': 'meta', 'types': ['movie', 'series'], 'idPrefixes': ['tt', 'tmdb:']}],

@@ -117,6 +117,32 @@ TMDB requests are paced separately from TorBox availability checks. Positive ID
 mappings last seven days, confirmed missing IMDb mappings one day. No media is
 served through this app.
 
+### Recent releases and cinema discovery (0.8.1)
+
+Use `releasedWithinDays` (1–3650) in a discover definition to bound its release
+window. For example, 180 days for new movies and 365 for new series. Movies use
+their primary release date; series use their first premiere date, not the latest
+episode or season. The UTC date boundaries advance automatically with each crawl.
+`releasedOnly` must remain enabled with this option. Sorting by date alone does
+not imply a recent-release window.
+
+For a cinema shelf use a movie definition with filters such as:
+
+```json
+{"listType":"now_playing","region":"EE","includeAdult":false,"releasedOnly":true}
+```
+
+This calls TMDB’s official Now Playing endpoint, optionally using a two-letter
+country code. Its calendar can include upcoming days, so the app excludes entries
+with future, missing or invalid release dates and adult entries. Older films
+listed as theatrical reissues remain eligible. Pagination always follows the raw
+TMDB cursor, even when a whole page is excluded. Unsupported extra filters are
+rejected; ratings, genre and sort filters cannot silently alter this mode.
+
+A cinema feed is discovery metadata, not live local showtimes. Only titles with
+acceptable cached streams are published, so this section can legitimately be
+short or empty. Cinema discovery never relaxes the playback policy.
+
 This product uses the TMDB API but is not endorsed or certified by TMDB.
 
 ## Installation and switch-over

@@ -9,7 +9,7 @@ import json
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -51,7 +51,8 @@ class TMDBDiscovery:
     FILTERS = frozenset({'sortBy', 'imdbOnly', 'listType', 'includeAdult',
                          'releaseTypes', 'releasedOnly', 'voteCountMin',
                          'ratingMin', 'ratingMax', 'genres', 'excludeGenres',
-                         'genreMatchMode', 'tvType'})
+                         'genreMatchMode', 'tvType', 'releasedWithinDays', 'region'})
+    NOW_PLAYING_FILTERS = frozenset({'listType', 'includeAdult', 'releasedOnly', 'region'})
 
     def __init__(self, api_key, catalogs, language='en-US', request_json=None,
                  today=None, resolve_identity=None):
@@ -88,11 +89,33 @@ class TMDBDiscovery:
         filters = value.get('filters', {})
         if not isinstance(filters, dict) or set(filters) - cls.FILTERS:
             raise ValueError('Unsupported TMDB catalogue filters')
-        if filters.get('listType', 'discover') != 'discover' or filters.get('imdbOnly', False) is not False:
-            raise ValueError('Only TMDB discover lists with optional IMDb identities are supported')
+        list_type = filters.get('listType', 'discover')
+        if list_type not in ('discover', 'now_playing'):
+            raise ValueError('Unsupported TMDB list type')
         for field in ('includeAdult', 'releasedOnly'):
             if field in filters and not isinstance(filters[field], bool):
                 raise ValueError('Invalid TMDB boolean filter')
+        if 'region' in filters and (not isinstance(filters['region'], str)
+                                    or not re.fullmatch(r'[A-Z]{2}', filters['region'])):
+            raise ValueError('TMDB region must be an uppercase two-letter country code')
+        if list_type == 'now_playing':
+            if value['type'] != 'movie':
+                raise ValueError('TMDB now-playing lists support movies only')
+            if set(filters) - cls.NOW_PLAYING_FILTERS:
+                raise ValueError('Unsupported filters for the TMDB now-playing list')
+            if filters.get('includeAdult', False) or not filters.get('releasedOnly', True):
+                raise ValueError('TMDB now-playing lists require released, non-adult movies')
+            return
+        if 'region' in filters:
+            raise ValueError('TMDB region is supported only for now-playing lists')
+        if filters.get('imdbOnly', False) is not False:
+            raise ValueError('TMDB discover lists require optional IMDb identities')
+        if 'releasedWithinDays' in filters:
+            days = filters['releasedWithinDays']
+            if not _integer(days, 1) or days > 3650:
+                raise ValueError('TMDB release window must be an integer from 1 to 3650 days')
+            if not filters.get('releasedOnly', True):
+                raise ValueError('A TMDB release window requires releasedOnly')
         sorts = {'popularity.desc', 'popularity.asc', 'vote_average.desc', 'vote_average.asc',
                  'vote_count.desc', 'vote_count.asc'}
         sorts |= ({'primary_release_date.desc', 'primary_release_date.asc', 'title.asc', 'title.desc'}
@@ -192,9 +215,21 @@ class TMDBDiscovery:
 
     def _parameters(self, catalog, page):
         filters = catalog.get('filters', {})
+        if filters.get('listType') == 'now_playing':
+            # These are the endpoint's only query options. Its own theatrical
+            # calendar supplies the date and release-type selection.
+            params = {'page': page, 'language': self.language}
+            if 'region' in filters:
+                params['region'] = filters['region']
+            return params
         params = {'page': page, 'language': self.language,
                   'sort_by': filters.get('sortBy', 'popularity.desc'),
                   'include_adult': str(filters.get('includeAdult', False)).lower()}
+        today = self._today() if filters.get('releasedOnly', True) else None
+        if 'releasedWithinDays' in filters:
+            start = (date.fromisoformat(today) - timedelta(days=filters['releasedWithinDays'])).isoformat()
+            date_key = 'primary_release_date' if catalog['type'] == 'movie' else 'first_air_date'
+            params[date_key + '.gte'] = start
         for field, target in (('ratingMin', 'vote_average.gte'), ('ratingMax', 'vote_average.lte'),
                               ('voteCountMin', 'vote_count.gte')):
             if field in filters:
@@ -208,13 +243,13 @@ class TMDBDiscovery:
             if filters.get('releaseTypes'):
                 params['with_release_type'] = '|'.join(map(str, filters['releaseTypes']))
             if filters.get('releasedOnly', True):
-                params['primary_release_date.lte'] = self._today()
+                params['primary_release_date.lte'] = today
         else:
             params['include_null_first_air_dates'] = 'false'
             if filters.get('tvType'):
                 params['with_type'] = filters['tvType']
             if filters.get('releasedOnly', True):
-                params['first_air_date.lte'] = self._today()
+                params['first_air_date.lte'] = today
                 params['with_status'] = '0|3|4|5'
         return params
 
@@ -244,6 +279,22 @@ class TMDBDiscovery:
                 preview[target] = 'https://image.tmdb.org/t/p/' + size + path
         return preview
 
+    @staticmethod
+    def _released_cinema_item(item, today):
+        # TMDB's theatrical calendar can extend into next week. Keep that list
+        # for regional reissues, but enforce our releasedOnly contract locally.
+        if not isinstance(item, dict):
+            raise TMDBError('TMDB returned an invalid catalogue item')
+        if item.get('adult') is True:
+            return False
+        released = item.get('release_date')
+        if not isinstance(released, str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}', released):
+            return False
+        try:
+            return date.fromisoformat(released) <= today
+        except ValueError:
+            return False
+
     def catalog(self, kind, ident, offset=0):
         """Fetch one TMDB page, keeping its original cursor even after slicing.
 
@@ -258,7 +309,9 @@ class TMDBDiscovery:
             raise ValueError('TMDB catalogue offset is outside the supported range')
         page = offset // self.PAGE_SIZE + 1
         media = 'movie' if kind == 'movie' else 'tv'
-        response = self._fetch('/discover/' + media, self._parameters(definition, page))
+        endpoint = ('/movie/now_playing' if definition.get('filters', {}).get('listType') == 'now_playing'
+                    else '/discover/' + media)
+        response = self._fetch(endpoint, self._parameters(definition, page))
         items = response.get('results')
         total_pages, total_results = response.get('total_pages'), response.get('total_results')
         if (not isinstance(items, list) or len(items) > self.PAGE_SIZE
@@ -276,6 +329,12 @@ class TMDBDiscovery:
         if total_pages not in valid_pages or len(items) != expected_count:
             raise TMDBError('TMDB returned incomplete catalogue pagination')
         complete = page >= min(total_pages, self.MAX_PAGE)
-        previews = [self._preview(kind, item) for item in items[offset % self.PAGE_SIZE:]]
+        selected = items[offset % self.PAGE_SIZE:]
+        if definition.get('filters', {}).get('listType') == 'now_playing':
+            today = date.fromisoformat(self._today())
+            selected = [item for item in selected if self._released_cinema_item(item, today)]
+        previews = [self._preview(kind, item) for item in selected]
+        # Filtering must never change the upstream cursor or completion signal:
+        # a page containing only future releases is not an empty source page.
         return {'metas': previews, 'complete': complete,
                 'next_offset': max(offset, (page - 1) * self.PAGE_SIZE + len(items))}

@@ -270,5 +270,153 @@ class IdentityAndTransportTests(unittest.TestCase):
         self.assertIsNone(_NoRedirect().redirect_request(None, None, 302, None, None, 'https://other.invalid'))
 
 
+class CurrentSelectionTests(unittest.TestCase):
+    def adapter(self, catalog, request, today=lambda: '2026-10-08'):
+        return TMDBDiscovery('a' * 32, [catalog], request_json=request, today=today,
+                             resolve_identity=lambda kind, ident: 'tt%07d' % ident)
+
+    def cinema(self, **filters):
+        return {'id': 'local.in-cinemas', 'type': 'movie', 'name': 'In Cinemas',
+                'filters': {'listType': 'now_playing', 'includeAdult': False,
+                            'releasedOnly': True, **filters}}
+
+    def test_movie_window_sets_recent_lower_bound_and_excludes_future_dates(self):
+        request = Mock(return_value=response())
+        adapter = self.adapter(definition(releasedWithinDays=90, sortBy='popularity.desc'), request)
+        adapter.catalog('movie', 'original-upstream.movie')
+        path, params = request.call_args.args
+        self.assertEqual(path, '/discover/movie')
+        self.assertEqual(params['primary_release_date.gte'], '2026-07-10')
+        self.assertEqual(params['primary_release_date.lte'], '2026-10-08')
+        self.assertEqual(params['sort_by'], 'popularity.desc')
+        self.assertNotIn('first_air_date.gte', params)
+
+    def test_series_window_uses_premiere_dates_and_preserves_scripted_filters(self):
+        request = Mock(return_value=response(kind='series'))
+        adapter = self.adapter(definition('series', releasedWithinDays=365, tvType='2|4',
+                                           excludeGenres=[10763, 10764, 10767]), request)
+        adapter.catalog('series', 'original-upstream.series')
+        path, params = request.call_args.args
+        self.assertEqual(path, '/discover/tv')
+        self.assertEqual(params['first_air_date.gte'], '2025-10-08')
+        self.assertEqual(params['first_air_date.lte'], '2026-10-08')
+        self.assertEqual(params['with_type'], '2|4')
+        self.assertEqual(params['without_genres'], '10763|10764|10767')
+        self.assertNotIn('air_date.gte', params)
+
+    def test_release_windows_follow_calendar_leap_days_and_year_boundaries(self):
+        for today, days, expected in (('2024-03-01', 1, '2024-02-29'),
+                                       ('2025-03-01', 1, '2025-02-28'),
+                                       ('2026-01-15', 31, '2025-12-15'),
+                                       ('2026-10-08', 3650, '2016-10-10')):
+            with self.subTest(today=today, days=days):
+                request = Mock(return_value=response())
+                adapter = self.adapter(definition(releasedWithinDays=days), request, lambda: today)
+                adapter.catalog('movie', 'original-upstream.movie')
+                self.assertEqual(request.call_args.args[1]['primary_release_date.gte'], expected)
+                self.assertEqual(request.call_args.args[1]['primary_release_date.lte'], today)
+
+    def test_window_is_recomputed_on_refresh_and_uses_one_consistent_today(self):
+        clock = Mock(side_effect=['2026-10-08', '2026-10-09'])
+        request = Mock(return_value=response())
+        adapter = self.adapter(definition(releasedWithinDays=1), request, clock)
+        adapter.catalog('movie', 'original-upstream.movie')
+        adapter.catalog('movie', 'original-upstream.movie')
+        first = request.call_args_list[0].args[1]
+        second = request.call_args_list[1].args[1]
+        self.assertEqual((first['primary_release_date.gte'], first['primary_release_date.lte']),
+                         ('2026-10-07', '2026-10-08'))
+        self.assertEqual((second['primary_release_date.gte'], second['primary_release_date.lte']),
+                         ('2026-10-08', '2026-10-09'))
+        self.assertEqual(clock.call_count, 2)
+
+    def test_invalid_or_contradictory_release_windows_fail_configuration(self):
+        for value in (0, -1, 3651, True, 30.0, '30', None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.adapter(definition(releasedWithinDays=value), Mock())
+        with self.assertRaises(ValueError):
+            self.adapter(definition(releasedWithinDays=30, releasedOnly=False), Mock())
+
+    def test_now_playing_uses_official_endpoint_region_and_preserves_pagination(self):
+        request = Mock(side_effect=[response(1, 21), response(2, 21)])
+        adapter = self.adapter(self.cinema(region='EE'), request)
+        first = adapter.catalog('movie', 'local.in-cinemas')
+        last = adapter.catalog('movie', 'local.in-cinemas', first['next_offset'])
+        self.assertEqual(request.call_args_list[0].args,
+                         ('/movie/now_playing', {'page': 1, 'language': 'en-US', 'region': 'EE'}))
+        self.assertEqual(request.call_args_list[1].args,
+                         ('/movie/now_playing', {'page': 2, 'language': 'en-US', 'region': 'EE'}))
+        self.assertFalse(first['complete'])
+        self.assertTrue(last['complete'])
+        self.assertEqual(last['next_offset'], 21)
+        self.assertEqual(last['metas'][0]['id'], 'tt0000021')
+
+    def test_now_playing_can_use_default_region_without_sending_unsupported_parameters(self):
+        request = Mock(return_value=response(total=0))
+        clock = Mock(return_value='2026-10-08')
+        result = self.adapter(self.cinema(), request, clock).catalog('movie', 'local.in-cinemas')
+        self.assertEqual(request.call_args.args, ('/movie/now_playing', {'page': 1, 'language': 'en-US'}))
+        self.assertEqual(result, {'metas': [], 'complete': True, 'next_offset': 0})
+        self.assertEqual(clock.call_count, 1)
+
+    def test_now_playing_rejects_filters_it_cannot_apply_instead_of_ignoring_them(self):
+        for extra in ({'sortBy': 'popularity.desc'}, {'voteCountMin': 0}, {'ratingMin': 7},
+                      {'genres': [16]}, {'releaseTypes': [2, 3]}, {'releasedWithinDays': 30},
+                      {'imdbOnly': False}, {'includeAdult': True}, {'releasedOnly': False},
+                      {'region': 'ee'}, {'region': 'EST'}, {'region': 12}, {'region': ''}):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                self.adapter(self.cinema(**extra), Mock())
+        series = self.cinema()
+        series['type'] = 'series'
+        with self.assertRaises(ValueError):
+            self.adapter(series, Mock())
+        with self.assertRaises(ValueError):
+            self.adapter(definition(region='EE'), Mock())
+
+    def test_now_playing_applies_the_same_authoritative_completion_validation(self):
+        bad = response(total=1)
+        bad['total_results'] = 100
+        request = Mock(return_value=bad)
+        with self.assertRaises(TMDBError):
+            self.adapter(self.cinema(), request).catalog('movie', 'local.in-cinemas')
+
+    def test_now_playing_all_future_page_advances_raw_cursor_and_does_not_finish(self):
+        upcoming = response(1, 21)
+        for entry in upcoming['results']:
+            entry['release_date'] = '2026-10-09'
+        request = Mock(side_effect=[upcoming, response(2, 21)])
+        adapter = self.adapter(self.cinema(), request)
+        first = adapter.catalog('movie', 'local.in-cinemas')
+        self.assertEqual(first, {'metas': [], 'complete': False, 'next_offset': 20})
+        last = adapter.catalog('movie', 'local.in-cinemas', first['next_offset'])
+        self.assertEqual(last['metas'][0]['tmdbId'], 21)
+        self.assertTrue(last['complete'])
+        self.assertEqual(last['next_offset'], 21)
+
+    def test_now_playing_all_future_final_page_can_authoritatively_clear_stale_items(self):
+        upcoming = response(total=2)
+        for entry in upcoming['results']:
+            entry['release_date'] = '2026-10-09'
+        result = self.adapter(self.cinema(), Mock(return_value=upcoming)).catalog('movie', 'local.in-cinemas')
+        self.assertEqual(result, {'metas': [], 'complete': True, 'next_offset': 2})
+
+    def test_now_playing_keeps_today_and_old_reissues_but_omits_unknown_invalid_and_adult(self):
+        payload = response(total=10)
+        dates = ['1980-05-23', '2026-10-08', '2026-10-09', '', None,
+                 '2026-02-30', '20261008', 'not-a-date', '2026-10-07', '2026-10-07']
+        for entry, released in zip(payload['results'], dates):
+            entry['release_date'] = released
+        payload['results'][8]['adult'] = True
+        del payload['results'][9]['release_date']
+        clock = Mock(return_value='2026-10-08')
+        adapter = self.adapter(self.cinema(), Mock(return_value=payload), clock)
+        result = adapter.catalog('movie', 'local.in-cinemas')
+        self.assertEqual([entry['tmdbId'] for entry in result['metas']], [1, 2])
+        self.assertEqual(result['metas'][0]['releaseInfo'], '1980')
+        self.assertEqual(result['next_offset'], 10)
+        self.assertTrue(result['complete'])
+        self.assertEqual(clock.call_count, 1)
+
+
 if __name__ == '__main__':
     unittest.main()

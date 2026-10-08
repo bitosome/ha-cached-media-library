@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.1
+
+- Add rolling release windows for honest recent-movie and series-premiere categories.
+- Add regional In Cinemas discovery using TMDB’s official Now Playing feed.
+- Exclude unreleased or undated entries from cinema results while preserving pagination across filtered pages.
+- Reject unsupported filter combinations rather than silently ignoring selection rules.
+
 ## 0.8.0
 
 - Run configured discovery catalogues directly against TMDB without a hosted Discover service.
