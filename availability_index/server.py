@@ -1087,6 +1087,7 @@ class App:
         self.policy_lock = threading.RLock()
         self.inflight = set()
         self.check_queue = {}
+        self.check_dispatches = 0
         self.stop = threading.Event()
         self.heartbeats = {}
         self.threads = {}
@@ -1373,7 +1374,7 @@ class App:
             if not self.ready:
                 raise RuntimeError('Search discovery is not ready')
             ids = self.store.add_search_results(kind, result['metas'], time.time())
-            for ident in ids:
+            for ident in reversed(ids):
                 self.prioritize(kind, ident=ident)
         return ids
 
@@ -1464,6 +1465,29 @@ class App:
     def next_check(self, preferred):
         with self.store.lock:
             now = time.time()
+            self.check_dispatches += 1
+            # One in four dispatch opportunities can serve explicit client
+            # interest before renewals. Otherwise a large renewal backlog can
+            # indefinitely delay the first check of a newly searched title.
+            # Keep the shared request pacing and provider retry deadlines intact.
+            if self.check_dispatches % 4 == 0:
+                requested = self.store.db.execute('''SELECT c.* FROM checks c JOIN titles t
+                  ON t.type=c.type AND t.id=c.parent WHERE t.scan_touched<0 AND c.due<?
+                  AND EXISTS(SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category
+                    WHERE m.type=c.type AND m.id=c.parent AND cat.active=1)
+                  ORDER BY t.scan_touched,t.rank,(c.attempted>0),c.priority,c.due,c.id LIMIT ?''',
+                  (now, 20 + len(self.inflight))).fetchall()
+                for row in requested:
+                    key = (row['type'], row['id'], row['parent'])
+                    if key in self.inflight:
+                        continue
+                    self.inflight.add(key)
+                    # A series receives one prompt initial probe; its remaining
+                    # episodes then share the ordinary rotating scan budget.
+                    self.store.db.execute('UPDATE titles SET scan_touched=? WHERE type=? AND id=?',
+                                          (now,row['type'],row['parent']))
+                    self.store.db.commit()
+                    return row
             # Renew still-visible confirmations first. Expired evidence no longer
             # protects a visible title and must share the ordinary scan budget;
             # otherwise error-only retries could monopolise this priority forever.
@@ -1565,7 +1589,7 @@ class App:
         for kind in ('movie', 'series'):
             catalogs.append({'id': 'cached-search', 'type': kind, 'name': 'Available ' + kind + ' search',
                              'extra': [{'name': 'search', 'isRequired': True}, {'name': 'skip', 'isRequired': False}]})
-        return {'id': 'local.cached.media.library', 'version': '0.9.0', 'name': 'Cached Media Library',
+        return {'id': 'local.cached.media.library', 'version': '0.9.1', 'name': 'Cached Media Library',
                 'description': 'Recently verified cached streams matching your AIOStreams filters. Metadata only.',
                 'types': ['movie', 'series'],
                 'resources': ['catalog', {'name': 'meta', 'types': ['movie', 'series'], 'idPrefixes': ['tt', 'tmdb:']}],

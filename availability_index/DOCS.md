@@ -295,7 +295,9 @@ saved playback profile until effective-policy resolution is supported.
 Movie and series work use separate queues and alternate when both have work.
 Unverified shows receive one probe per rotation to spread coverage across titles;
 verified or explicitly requested shows can use the configured episode batch.
-Still-valid confirmations due for renewal take priority over expanding the
+One in four dispatch opportunities can prioritise an explicitly searched or
+opened title ahead of renewals, while respecting provider retry deadlines.
+Otherwise still-valid confirmations due for renewal take priority over expanding the
 unchecked backlog. Expired confirmations rejoin ordinary scheduling. A large
 complete-episode index can still take days to cover within provider limits.
 

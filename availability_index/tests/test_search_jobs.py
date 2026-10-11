@@ -101,6 +101,36 @@ class SearchAppTests(unittest.TestCase):
         self.app.ready = False
         self.assertEqual(self.app.search_catalog('movie', 'Puss in Boots'), [])
 
+    def test_search_gets_a_bounded_share_ahead_of_renewal_backlog(self):
+        now = time.time()
+        self.app.store.add_categories([{'type': 'movie', 'id': 'shelf', 'name': 'Shelf'}], 'cachedlibrary')
+        cat = self.app.store.db.execute("SELECT * FROM categories WHERE search_only=0").fetchone()
+        self.app.store.add_page(cat, [{'id': 'tt' + str(i), 'name': 'Old ' + str(i)} for i in range(10)], 0, 10)
+        for i in range(10):
+            self.app.store.record('movie', 'tt'+str(i), 'tt'+str(i), 'available', 1, now - 35000)
+        self.app.discover_search('movie', 'Puss in Boots')
+        chosen = []
+        for _ in range(4):
+            row = self.app.next_check('movie')
+            chosen.append(row['id'])
+        self.assertNotIn('tt1234567', chosen[:3])
+        self.assertEqual(chosen[3], 'tt1234567')
+        self.assertEqual(self.app.store.catalog('movie', 'cached-search', search='Puss in Boots'), [])
+
+    def test_interest_does_not_bypass_provider_retry_deadline(self):
+        self.app.discover_search('movie', 'Puss in Boots')
+        self.app.store.db.execute('UPDATE checks SET due=?', (time.time() + 3600,))
+        self.app.store.db.commit()
+        for _ in range(8):
+            self.assertIsNone(self.app.next_check('movie'))
+
+    def test_remote_search_keeps_most_relevant_candidate_first(self):
+        self.app.tmdb.search.return_value = {'metas': [
+            {'id': 'tt1234567', 'name': 'Puss in Boots'},
+            {'id': 'tt2234567', 'name': 'Puss in Boots: The Last Wish'}]}
+        self.app.discover_search('movie', 'Puss in Boots')
+        self.assertEqual(self.app.next_check('movie')['id'], 'tt1234567')
+
     def test_remote_discovery_worker_does_not_fetch_streams(self):
         self.app.request = Mock(side_effect=AssertionError('unexpected stream or metadata fetch'))
         job = self.app.search_jobs.submit('series', 'Puss in Boots')

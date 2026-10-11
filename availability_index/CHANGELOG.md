@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.9.1
+
+- Reserve one in four check dispatch opportunities for explicit search/detail
+  interest, so a large renewal backlog cannot starve a newly discovered title.
+  Shared rate limits, provider backoff and cached-only evidence gates still apply.
+- Prioritise the most relevant remote search candidates before later matches.
+
+
 ## 0.9.0
 
 - Match title searches by relevance, tolerating extra English articles, punctuation,
