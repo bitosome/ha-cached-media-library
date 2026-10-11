@@ -267,6 +267,12 @@ class TMDBDiscovery:
                    'type': kind, 'name': name, 'posterShape': 'poster',
                    'description': item.get('overview') or '',
                    'genres': [GENRES[ident] for ident in genre_ids if ident in GENRES]}
+        original_field = 'original_title' if kind == 'movie' else 'original_name'
+        original = item.get(original_field)
+        if isinstance(original, str) and original.strip():
+            # Keep the original-language title searchable when TMDB's chosen
+            # presentation language supplies a translated display name.
+            preview[original_field] = original
         if imdb_id:
             preview['imdb_id'] = imdb_id
             preview['imdbId'] = imdb_id
@@ -283,17 +289,96 @@ class TMDBDiscovery:
     def _released_cinema_item(item, today):
         # TMDB's theatrical calendar can extend into next week. Keep that list
         # for regional reissues, but enforce our releasedOnly contract locally.
+        return TMDBDiscovery._released_item(item, today, 'release_date')
+
+    @staticmethod
+    def _released_item(item, today, date_field):
         if not isinstance(item, dict):
             raise TMDBError('TMDB returned an invalid catalogue item')
         if item.get('adult') is True:
             return False
-        released = item.get('release_date')
+        released = item.get(date_field)
         if not isinstance(released, str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}', released):
             return False
         try:
             return date.fromisoformat(released) <= today
         except ValueError:
             return False
+
+    def search(self, kind, query, deadline=None):
+        """Discover at most one page of candidates for an explicit title search.
+
+        These previews are metadata only, not availability evidence. The caller
+        must index and verify them before publishing any playable results. A
+        transport or identity error raises rather than becoming an empty search.
+        The monotonic deadline is checked between requests; an in-flight request
+        retains the transport's bounded timeout.
+        """
+        if kind not in ('movie', 'series') or not isinstance(query, str):
+            raise ValueError('Invalid TMDB title search')
+        query = ' '.join(query.split())
+        if not query or len(query) > 200:
+            raise ValueError('TMDB search must contain 1 to 200 characters')
+        deadline = time.monotonic() + 20 if deadline is None else deadline
+        def check_deadline():
+            if time.monotonic() >= deadline:
+                raise TMDBError('TMDB title search timed out')
+
+        media = 'movie' if kind == 'movie' else 'tv'
+        # A translated display title must match the user's query after the
+        # candidate is indexed. Asking for Russian metadata also retains the
+        # original title, so English remains searchable for the same identity.
+        language = 'ru-RU' if re.search(r'[\u0400-\u052f]', query) else self.language
+        params = {'page': 1, 'language': language, 'include_adult': 'false',
+                  'query': query}
+        check_deadline()
+        result = self._fetch('/search/' + media, params)
+        items = self._page_items(result, 1, 'search')
+        # Common title recollections add an English article, e.g. "Puss in the
+        # Boots". Only broaden a genuinely empty result, never a provider error
+        # or a page whose candidates have not passed our release policy.
+        fallback = re.sub(r'\b(?:a|an|the)\b', ' ', query, flags=re.IGNORECASE)
+        fallback = ' '.join(fallback.split())
+        if not items and fallback and fallback.casefold() != query.casefold():
+            check_deadline()
+            result = self._fetch('/search/' + media, dict(params, query=fallback))
+            items = self._page_items(result, 1, 'search')
+        today = date.fromisoformat(self._today())
+        date_field = 'release_date' if kind == 'movie' else 'first_air_date'
+        selected = [item for item in items if self._released_item(item, today, date_field)]
+        previews = []
+        for item in selected:
+            check_deadline()
+            genre_ids = item.get('genre_ids', [])
+            if not _numbers(genre_ids):
+                raise TMDBError('TMDB returned invalid catalogue genres')
+            if kind == 'series' and {10763, 10764, 10767}.intersection(genre_ids):
+                # Keep the same News/Reality/Talk exclusion as discovery without
+                # adding a details request for every search candidate.
+                continue
+            previews.append(self._preview(kind, item))
+        check_deadline()
+        return {'metas': previews}
+
+    def _page_items(self, response, page, resource='catalogue'):
+        """Reject truncated/error pages before treating absence as authoritative."""
+        items = response.get('results')
+        total_pages, total_results = response.get('total_pages'), response.get('total_results')
+        if (not isinstance(items, list) or len(items) > self.PAGE_SIZE
+                or not _integer(response.get('page'), 1) or response['page'] != page
+                or not _integer(total_pages) or not _integer(total_results)):
+            raise TMDBError('TMDB returned invalid ' + resource + ' pagination')
+        expected_pages = (total_results + self.PAGE_SIZE - 1) // self.PAGE_SIZE
+        valid_pages = ({0, 1} if not total_results else {expected_pages})
+        if expected_pages > self.MAX_PAGE:
+            # The API limits accessible pages to 500. Its count may advertise
+            # the full result set or that access cap; neither makes an early
+            # short page authoritative.
+            valid_pages.add(self.MAX_PAGE)
+        expected_count = min(self.PAGE_SIZE, max(0, total_results - (page - 1) * self.PAGE_SIZE))
+        if total_pages not in valid_pages or len(items) != expected_count:
+            raise TMDBError('TMDB returned incomplete ' + resource + ' pagination')
+        return items
 
     def catalog(self, kind, ident, offset=0):
         """Fetch one TMDB page, keeping its original cursor even after slicing.
@@ -312,22 +397,8 @@ class TMDBDiscovery:
         endpoint = ('/movie/now_playing' if definition.get('filters', {}).get('listType') == 'now_playing'
                     else '/discover/' + media)
         response = self._fetch(endpoint, self._parameters(definition, page))
-        items = response.get('results')
-        total_pages, total_results = response.get('total_pages'), response.get('total_results')
-        if (not isinstance(items, list) or len(items) > self.PAGE_SIZE
-                or not _integer(response.get('page'), 1) or response['page'] != page
-                or not _integer(total_pages) or not _integer(total_results)):
-            raise TMDBError('TMDB returned invalid catalogue pagination')
-        expected_pages = (total_results + self.PAGE_SIZE - 1) // self.PAGE_SIZE
-        valid_pages = ({0, 1} if not total_results else {expected_pages})
-        if expected_pages > self.MAX_PAGE:
-            # The API limits accessible pages to 500. Its count may advertise
-            # the full result set or that access cap; neither makes an early
-            # short page authoritative.
-            valid_pages.add(self.MAX_PAGE)
-        expected_count = min(self.PAGE_SIZE, max(0, total_results - (page - 1) * self.PAGE_SIZE))
-        if total_pages not in valid_pages or len(items) != expected_count:
-            raise TMDBError('TMDB returned incomplete catalogue pagination')
+        items = self._page_items(response, page)
+        total_pages = response['total_pages']
         complete = page >= min(total_pages, self.MAX_PAGE)
         selected = items[offset % self.PAGE_SIZE:]
         if definition.get('filters', {}).get('listType') == 'now_playing':

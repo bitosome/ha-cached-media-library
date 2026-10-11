@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.0
+
+- Match title searches by relevance, tolerating extra English articles, punctuation,
+  repeated spaces and Latin accents; preserve short titles and sequel numbers.
+- Discover search candidates directly through the official TMDB API, including
+  Russian title queries and original names, beyond the visible shelf depth.
+- Retain at most 1,000 search candidates per media type for seven days in a hidden
+  pool. Publish them only after the existing workers confirm cached availability
+  under the active AIOStreams policy; never publish raw TMDB search results.
+- Bound query discovery, duplicate requests, recent-query memory and HTTP waiting.
+  Existing confirmed results remain usable if TMDB search fails.
+- Match lightweight title fields before loading full series metadata.
+
+
 ## 0.8.2
 
 - Keep metadata parent IDs consistent with catalogue and search IDs so Infuse season requests return the verified episodes.

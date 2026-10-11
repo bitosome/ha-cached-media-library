@@ -257,10 +257,31 @@ Opening or searching for a known title advances its pending checks, with a
 five-minute cooldown per title. Unverified results stay hidden; retry the search
 after the checks complete. This priority does not bypass the shared request limit.
 
-**Search covers indexed candidates only.** A cached title outside those catalogues
-or their configured depth will not appear. Raising catalogue depth improves
-coverage at the cost of more checking. On-demand upstream discovery is not part
-of this version.
+**Search also discovers titles beyond the visible catalogues.** With native TMDB
+configured, a title query retrieves up to one page (20 candidates per media type)
+from the official TMDB search API. Cyrillic queries request Russian metadata;
+original titles remain searchable. Local matching tolerates optional English
+articles, punctuation, repeated spaces and Latin accents, with exact titles first.
+It does not guess arbitrary misspellings or claim complete TMDB-wide search results.
+
+New candidates enter a hidden pool, limited to 1,000 movies and 1,000 series,
+retained for seven days after their last query discovery. The pool is independent
+of category depth and does not add visible shelves. Existing metadata, confirmations
+and ordinary category membership are preserved. Expiry removes only search-only
+membership and genuinely orphaned candidates. Categories continue their normal
+scheduled refresh; title queries perform bounded discovery on demand.
+
+Raw search metadata never becomes an available result. Existing workers fetch
+original episode metadata and verify streams through the unchanged cached-only
+policy and shared request budget. A request waits at most ten seconds for initial
+matches; a new title can require a repeated search after background verification.
+Previously confirmed matches return immediately. Provider errors never become
+negative availability evidence. There are two query workers, at most 16 queued
+queries, four waiting HTTP requests and 128 recent query records. Successful
+query discovery is reused for ten minutes; failed discovery retries after 30 seconds.
+TMDB lookup has a cooperative 20-second budget, which may overrun by one in-flight
+HTTP request (transport timeout 30 seconds). Without native TMDB configured,
+search continues to use locally indexed candidates.
 
 The v0.7.0 policy fingerprint is intentionally broader. Its first synchronisation
 invalidates verdicts from earlier versions, so the visible library temporarily

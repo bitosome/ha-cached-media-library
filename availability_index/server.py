@@ -28,6 +28,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 from urllib.request import Request, urlopen
 
 from tmdb_discovery import TMDBDiscovery
+from search_matching import search_score
 
 # Include new/unknown settings conservatively. An allow-list of a few filters
 # missed language, resolution, size and provider changes and kept stale verdicts.
@@ -199,7 +200,7 @@ class Store:
         """Add columns introduced after a database was first created."""
         wanted = {'titles': [('priority', 'INTEGER DEFAULT 9999'), ('rank', 'INTEGER DEFAULT 999999'),
                              ('meta_claimed', 'REAL DEFAULT 0'), ('scan_touched', 'REAL DEFAULT 0')],
-                  'categories': [('active', 'INTEGER DEFAULT 1')]}
+                  'categories': [('active', 'INTEGER DEFAULT 1'), ('search_only', 'INTEGER NOT NULL DEFAULT 0')]}
         added = set()
         for table, columns in wanted.items():
             existing = {row[1] for row in self.db.execute('PRAGMA table_info(%s)' % table)}
@@ -264,6 +265,121 @@ class Store:
         for document in documents:
             collect(document)
         return '\n'.join(sorted(names))
+
+    def _prune_search_results(self, now):
+        """Hidden memberships use seen as expiry and rank as last search time."""
+        removed = 0
+        for category in self.db.execute('SELECT id,type FROM categories WHERE search_only=1').fetchall():
+            expired = {row[0] for row in self.db.execute('SELECT id FROM membership WHERE category=? AND seen<=?',
+                                                       (category['id'], now))}
+            cap = self.setting('search_pool_cap_' + category['type']) or 1000
+            evicted = {row[0] for row in self.db.execute('''SELECT id FROM membership WHERE category=? AND seen>?
+              ORDER BY rank DESC,id LIMIT -1 OFFSET ?''', (category['id'], now, cap))}
+            if expired or evicted:
+                removed += self.db.executemany('DELETE FROM membership WHERE category=? AND id=?',
+                                               [(category['id'], ident) for ident in expired | evicted]).rowcount
+        if removed:
+            # Evidence belonging to any ordinary shelf survives search eviction.
+            self.db.execute('''DELETE FROM checks WHERE NOT EXISTS
+              (SELECT 1 FROM membership m WHERE m.type=checks.type AND m.id=checks.parent)''')
+            self.db.execute('''DELETE FROM titles WHERE NOT EXISTS
+              (SELECT 1 FROM membership m WHERE m.type=titles.type AND m.id=titles.id)''')
+        return removed
+
+    def prune_search_results(self, now=None):
+        with self.lock:
+            existing_transaction = self.db.in_transaction
+            removed = self._prune_search_results(time.time() if now is None else now)
+            if removed and not existing_transaction:
+                self.db.commit()
+            return removed
+
+    def add_search_results(self, kind, previews, now, ttl=604800, cap=1000):
+        """Retain bounded discovery candidates without inventing availability.
+
+        The pool is independent of visible shelves and never gets crawled. Caller
+        queries are deliberately absent: only provider title aliases are indexed.
+        """
+        if (kind not in ('movie', 'series') or not isinstance(previews, list)
+                or isinstance(cap, bool) or not isinstance(cap, int) or not 1 <= cap <= 5000
+                or isinstance(ttl, bool) or not isinstance(ttl, (int, float))
+                or not math.isfinite(ttl) or not 60 <= ttl <= 2592000
+                or isinstance(now, bool) or not isinstance(now, (int, float))
+                or not math.isfinite(now) or now <= 0):
+            raise ValueError('Invalid search candidate pool')
+        prepared = []
+        fields = {'name', 'title', 'originalName', 'originalTitle', 'original_name', 'original_title',
+                  'alternativeTitles', 'alternative_titles', 'aliases', 'titles', 'poster', 'posterShape',
+                  'background', 'description', 'genres', 'releaseInfo', 'imdb_id', 'imdbId', 'tmdbId'}
+        for preview in previews[:cap]:
+            if (not isinstance(preview, dict) or not isinstance(preview.get('id'), str)
+                    or not re.fullmatch(r'(?:tt\d+|tmdb:[1-9]\d*)', preview['id'])
+                    or preview.get('type', kind) != kind
+                    or not isinstance(preview.get('name'), str) or not preview['name'].strip()
+                    or len(preview['name']) > 512):
+                raise ValueError('Invalid search candidate')
+            item = {key: copy.deepcopy(value) for key, value in preview.items() if key in fields}
+            item.update(id=preview['id'], type=kind)
+            if len(encode(item)) > 65536:
+                raise ValueError('Search candidate is too large')
+            if not isinstance(item.get('genres', []), list):
+                raise ValueError('Invalid search candidate genres')
+            item['genres'] = [v for v in item.get('genres', []) if isinstance(v, str)]
+            prepared.append(item)
+        with self.lock:
+            try:
+                category = 'internal-search-' + kind
+                self.db.execute('''INSERT INTO categories
+                  (id,type,name,upstream,position,extra,active,done,search_only)
+                  VALUES (?,?,?,?,100000,'[]',1,1,1) ON CONFLICT(id) DO UPDATE SET active=1,done=1''',
+                  (category, kind, 'Search candidates', category))
+                self.db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)',
+                                ('search_pool_cap_' + kind, encode(cap)))
+                for index, item in enumerate(prepared):
+                    previous = self.db.execute('SELECT preview,meta,search FROM titles WHERE type=? AND id=?',
+                                               (kind, item['id'])).fetchone()
+                    names = self.search_names(item, json.loads(previous['meta'] or '{}') if previous else {},
+                                              previous['search'].splitlines() if previous and previous['search'] else [])
+                    # A Russian search alias must not rename existing English shelves.
+                    self.db.execute('''INSERT INTO titles(type,id,preview,search,priority,rank)
+                      VALUES (?,?,?,?,9999,?) ON CONFLICT(type,id) DO UPDATE SET search=excluded.search''',
+                      (kind, item['id'], encode(item), names, index))
+                    self.db.execute('''INSERT INTO membership VALUES (?,?,?,?,?)
+                      ON CONFLICT(category,type,id) DO UPDATE SET rank=excluded.rank,seen=excluded.seen''',
+                      (category, kind, item['id'], now, now + ttl))
+                    if kind == 'movie':
+                        self.db.execute('INSERT OR IGNORE INTO checks(type,id,parent,priority) VALUES (?,?,?,9999)',
+                                        (kind, item['id'], item['id']))
+                self._prune_search_results(now)
+                retained = {row[0] for row in self.db.execute('SELECT id FROM membership WHERE category=?', (category,))}
+                self.db.commit()
+                return list(dict.fromkeys(item['id'] for item in prepared if item['id'] in retained))
+            except Exception:
+                self.db.rollback()
+                raise
+
+    def _search_rows(self, kind, query, now, verified=False):
+        # Long series have megabytes of episode metadata. Match lightweight title
+        # fields first; only selected candidates need their full documents loaded.
+        eligibility = '''AND EXISTS(SELECT 1 FROM checks c WHERE c.type=t.type AND c.parent=t.id
+          AND c.status='available' AND c.expires>?)''' if verified else ''
+        args = (kind, now + 60) if verified else (kind,)
+        rows = self.db.execute('''SELECT t.id,t.search,t.rank FROM titles t WHERE t.type=? AND EXISTS
+          (SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category
+           WHERE m.type=t.type AND m.id=t.id AND cat.active=1) ''' + eligibility, args).fetchall()
+        ranked = []
+        for row in rows:
+            score = search_score(query, row['search'])
+            if score is not None:
+                ranked.append((score, row['rank'], row['id']))
+        return [ident for _, _, ident in sorted(ranked)]
+
+    def search_matches(self, kind, query, limit=20, now=None):
+        """Rank known candidates, including pending ones, for worker priority."""
+        now = time.time() if now is None else now
+        with self.lock:
+            self.prune_search_results(now)
+            return self._search_rows(kind, query, now)[:max(0, limit)]
 
     def setting(self, key, value=None):
         with self.lock:
@@ -388,7 +504,7 @@ class Store:
                        generation=CASE WHEN categories.active=0 THEN categories.generation+1 ELSE categories.generation END,
                        active=1''',
                     (cid, cat['type'], cat.get('name', cat['id']), cat['id'], position, encode(cat.get('extra', []))))
-            for row in self.db.execute('SELECT id FROM categories WHERE active=1').fetchall():
+            for row in self.db.execute('SELECT id FROM categories WHERE active=1 AND search_only=0').fetchall():
                 if row['id'] not in retained:
                     self.db.execute('UPDATE categories SET active=0,generation=generation+1 WHERE id=?', (row['id'],))
             retired = [row[0] for row in self.db.execute('SELECT id FROM categories WHERE active=0').fetchall()]
@@ -423,7 +539,7 @@ class Store:
             depth_changed = legacy or previous['max_candidates'] != cap
             revision_changed = not legacy and previous['revision'] != settings['revision']
             restarted = 0
-            for cat in self.db.execute('SELECT * FROM categories WHERE active=1').fetchall():
+            for cat in self.db.execute('SELECT * FROM categories WHERE active=1 AND search_only=0').fetchall():
                 paginated = any(e.get('name') == 'skip' for e in json.loads(cat['extra']))
                 if legacy or revision_changed or (depth_changed and paginated):
                     self.db.execute('''UPDATE categories SET offset=0,done=0,refresh=0,
@@ -777,6 +893,7 @@ class Store:
                 raise
 
     def visible(self, kind, ident, now):
+        self.prune_search_results(now)
         return self.db.execute('''SELECT 1 FROM checks c WHERE type=? AND parent=? AND status='available' AND expires>?
           AND EXISTS (SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category
             WHERE m.type=c.type AND m.id=c.parent AND cat.active=1) LIMIT 1''',
@@ -800,23 +917,19 @@ class Store:
     def catalog(self, kind, cid, skip=0, search=None, genre=None, now=None):
         now = time.time() if now is None else now
         with self.lock:
+            self.prune_search_results(now)
             if search is not None:
-                rows = self.db.execute('''SELECT t.* FROM titles t WHERE t.type=? AND EXISTS
-                  (SELECT 1 FROM checks c WHERE c.type=t.type AND c.parent=t.id AND c.status='available' AND c.expires>?)
-                  AND EXISTS (SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category
-                    WHERE m.type=t.type AND m.id=t.id AND cat.active=1)
-                  ORDER BY t.id''', (kind, now + 60)).fetchall()
+                ids = self._search_rows(kind, search, now, verified=True)
+                rows = (self.db.execute('SELECT * FROM titles WHERE type=? AND id=?',
+                                       (kind, ident)).fetchone() for ident in ids)
             else:
                 rows = self.db.execute('''SELECT t.* FROM membership m JOIN titles t ON t.type=m.type AND t.id=m.id
-                  JOIN categories cat ON cat.id=m.category WHERE cat.active=1 AND m.category=? AND t.type=? AND EXISTS
+                  JOIN categories cat ON cat.id=m.category WHERE cat.active=1 AND cat.search_only=0 AND m.category=? AND t.type=? AND EXISTS
                   (SELECT 1 FROM checks c WHERE c.type=t.type AND c.parent=t.id AND c.status='available' AND c.expires>?)
                   ORDER BY m.rank,t.id''', (cid, kind, now + 60)).fetchall()
             result = []
             seen = set()
-            query = folded(search or '')
             for row in rows:
-                if query and query not in row['search']:
-                    continue
                 preview = json.loads(row['preview'])
                 meta = json.loads(row['meta'] or '{}')
                 genres = sorted(set(x for x in (preview.get('genres') or []) + (meta.get('genres') or []) if isinstance(x, str)))
@@ -839,12 +952,15 @@ class Store:
                 preview.pop('streams', None)
                 preview['genres'] = genres
                 result.append(preview)
+                if search is not None and len(result) >= max(0, skip) + 100:
+                    break
             return result[max(0, skip):max(0, skip) + 100]
 
     def genres(self, kind, now=None):
         """Genre facets come from the same currently verified pool as catalogues."""
         now = time.time() if now is None else now
         with self.lock:
+            self.prune_search_results(now)
             rows = self.db.execute('''SELECT t.preview,t.meta FROM titles t WHERE t.type=? AND EXISTS
               (SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category
                WHERE m.type=t.type AND m.id=t.id AND cat.active=1) AND EXISTS
@@ -917,14 +1033,15 @@ class Store:
         entry cannot leave a permanently empty shelf."""
         with self.lock:
             return self.db.execute('''SELECT c.* FROM categories c
-              WHERE c.active=1 AND (c.done=0 OR EXISTS(SELECT 1 FROM membership m WHERE m.category=c.id))
+              WHERE c.active=1 AND c.search_only=0 AND (c.done=0 OR EXISTS(SELECT 1 FROM membership m WHERE m.category=c.id))
               ORDER BY c.position''').fetchall()
 
     def status(self):
         now = time.time()
         with self.lock:
+            self.prune_search_results(now)
             categories = []
-            for c in self.db.execute('SELECT * FROM categories ORDER BY position').fetchall():
+            for c in self.db.execute('SELECT * FROM categories WHERE search_only=0 ORDER BY position').fetchall():
                 count = self.db.execute('''SELECT count(*) FROM membership m WHERE category=? AND EXISTS
                   (SELECT 1 FROM checks c WHERE c.type=m.type AND c.parent=m.id AND c.status='available' AND c.expires>?)''',
                   (c['id'], now + 60)).fetchone()[0]
@@ -933,6 +1050,8 @@ class Store:
                                    'index_complete': bool(c['done'])})
             return {
                 'categories': categories,
+                'search_candidates': dict(self.db.execute('''SELECT m.type,count(*) FROM membership m
+                  JOIN categories c ON c.id=m.category WHERE c.search_only=1 GROUP BY m.type''').fetchall()),
                 'checks': dict(self.db.execute('SELECT status,count(*) FROM checks GROUP BY status').fetchall()),
                 'verified_now': self.db.execute("SELECT count(*) FROM checks WHERE status='available' AND expires>?", (now + 60,)).fetchone()[0],
                 'retrying': self.db.execute('SELECT count(*) FROM checks WHERE failures>0').fetchone()[0],
@@ -942,6 +1061,8 @@ class Store:
 
 
 class App:
+    SEARCH_WAIT_SECONDS = 10
+
     def __init__(self, options, path):
         self.o = options
         self.store = Store(path, options.get('positive_hours', 12) * 3600, options.get('negative_hours', 24) * 3600,
@@ -971,6 +1092,9 @@ class App:
         self.threads = {}
         self.worker_errors = {}
         self.interest_times = {}
+        from search_jobs import SearchJobs
+        self.search_jobs = SearchJobs(self.discover_search, self.stop)
+        self.search_waiters = threading.BoundedSemaphore(4)
         self.pacing_lock = threading.Lock()
         self.next_stream_request = 0.0
         self.cooldown_until = 0.0
@@ -1128,6 +1252,7 @@ class App:
             if changed:
                 self.ready = False
             self.store.add_categories(catalogs, self.instance_id)
+            self.store.prune_search_results(time.time())
             self.store.configure_crawl(self.o.get('max_candidates_per_category', 250),
                                        self.o.get('catalog_refresh_hours', 6),
                                        self.crawl_revision())
@@ -1193,7 +1318,7 @@ class App:
                 self.stop.wait(3)
                 continue
             with self.store.lock:
-                cats = self.store.db.execute('SELECT * FROM categories WHERE active=1 ORDER BY offset,position').fetchall()
+                cats = self.store.db.execute('SELECT * FROM categories WHERE active=1 AND search_only=0 ORDER BY offset,position').fetchall()
             worked = False
             for cat in cats:
                 if cat['done'] and cat['refresh'] > time.time():
@@ -1240,24 +1365,78 @@ class App:
                 self.store.db.commit()
             return row
 
+    def discover_search(self, kind, query):
+        if not self.ready or not self.tmdb:
+            raise RuntimeError('Search discovery is not ready')
+        result = self.tmdb.search(kind, query, deadline=time.monotonic() + 20)
+        with self.policy_lock:
+            if not self.ready:
+                raise RuntimeError('Search discovery is not ready')
+            ids = self.store.add_search_results(kind, result['metas'], time.time())
+            for ident in ids:
+                self.prioritize(kind, ident=ident)
+        return ids
+
+    def search_worker(self, number):
+        name = 'search' + str(number)
+        while not self.stop.is_set():
+            self.heartbeats[name] = time.time()
+            if not self.ready:
+                self.stop.wait(1)
+                continue
+            self.search_jobs.run_one()
+
+    def search_catalog(self, kind, query, skip=0, genre=None):
+        # Local matches remain usable during a TMDB outage. Remote metadata is
+        # only a candidate: the normal workers must establish cached availability.
+        if (not isinstance(query, str) or not 1 <= len(query.strip()) <= 200
+                or not any(c.isalnum() for c in query) or not self.ready or self.stop.is_set()):
+            return []
+        self.prioritize(kind, search=query)
+        job = self.search_jobs.submit(kind, query) if self.tmdb else None
+        metas = self.store.catalog(kind, 'cached-search', skip, query, genre)
+        if job is None or metas:
+            return metas
+        # The HTTP server creates threads per request. Bound waiters as well as
+        # remote jobs so repeated searches cannot keep unlimited threads alive.
+        if not self.search_waiters.acquire(blocking=False):
+            return metas
+        try:
+            deadline = time.monotonic() + self.SEARCH_WAIT_SECONDS
+            while self.ready and not self.stop.is_set():
+                if job['done'].is_set() and (job['error'] or not job['ids']):
+                    return metas
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return metas
+                self.stop.wait(min(1, remaining))
+                if not self.ready or self.stop.is_set():
+                    return []
+                metas = self.store.catalog(kind, 'cached-search', skip, query, genre)
+                if metas:
+                    return metas
+            return []
+        finally:
+            self.search_waiters.release()
+
     def prioritize(self, kind, ident=None, search=None):
         """An actual client visit can advance pending work, never its verdict."""
         now = time.time()
         with self.store.lock:
-            where, value = ('t.id=?', ident) if ident is not None else ('instr(t.search,?)>0', folded(search or ''))
-            if not value:
-                return
-            rows = self.store.db.execute('''SELECT t.id FROM titles t WHERE t.type=? AND '''+where+'''
-              AND EXISTS(SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category
-                         WHERE m.type=t.type AND m.id=t.id AND cat.active=1)
-              ORDER BY t.rank,t.id LIMIT 20''',(kind,value)).fetchall()
+            if ident is not None:
+                rows = self.store.db.execute('''SELECT t.id FROM titles t WHERE t.type=? AND t.id=?
+                  AND EXISTS(SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category
+                             WHERE m.type=t.type AND m.id=t.id AND cat.active=1)''', (kind,ident)).fetchall()
+                ids = [row['id'] for row in rows]
+            else:
+                ids = self.store.search_matches(kind, search or '', limit=20)
             promoted = False
-            for row in rows:
-                key = (kind,row['id'])
+            for ident in ids:
+                key = (kind,ident)
                 if self.interest_times.get(key,0) > now-300:
                     continue
                 self.interest_times[key] = now
-                self.store.db.execute('UPDATE titles SET scan_touched=? WHERE type=? AND id=?',(-now,kind,row['id']))
+                self.store.db.execute('UPDATE titles SET scan_touched=? WHERE type=? AND id=?',(-now,kind,ident))
                 promoted = True
             if promoted:
                 self.check_queue.clear()
@@ -1386,7 +1565,7 @@ class App:
         for kind in ('movie', 'series'):
             catalogs.append({'id': 'cached-search', 'type': kind, 'name': 'Available ' + kind + ' search',
                              'extra': [{'name': 'search', 'isRequired': True}, {'name': 'skip', 'isRequired': False}]})
-        return {'id': 'local.cached.media.library', 'version': '0.8.2', 'name': 'Cached Media Library',
+        return {'id': 'local.cached.media.library', 'version': '0.9.0', 'name': 'Cached Media Library',
                 'description': 'Recently verified cached streams matching your AIOStreams filters. Metadata only.',
                 'types': ['movie', 'series'],
                 'resources': ['catalog', {'name': 'meta', 'types': ['movie', 'series'], 'idPrefixes': ['tt', 'tmdb:']}],
@@ -1404,6 +1583,8 @@ class App:
 
     def start(self):
         threads = [('sync', self.sync_loop), ('crawl', self.crawl_loop)]
+        if self.tmdb:
+            threads += [('search' + str(i), lambda i=i: self.search_worker(i)) for i in range(2)]
         threads += [('metadata' + str(i), lambda i=i: self.metadata_worker(i)) for i in range(self.o.get('metadata_workers', 2))]
         threads += [('worker' + str(i), lambda i=i: self.worker(i)) for i in range(self.o.get('workers', 2))]
         for name, func in threads:
@@ -1480,12 +1661,10 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             skip = 0
         search = extra.get('search', [None])[0]
-        if ident == 'cached-search' and search:
-            app.prioritize(kind,search=search)
-        if ident == 'cached-search' and not search:
-            metas = []
+        if ident == 'cached-search':
+            metas = app.search_catalog(kind, search, skip, extra.get('genre', [None])[0]) if search else []
         else:
-            metas = app.store.catalog(kind, ident, skip, search if ident == 'cached-search' else None, extra.get('genre', [None])[0])
+            metas = app.store.catalog(kind, ident, skip, None, extra.get('genre', [None])[0])
         self.send({'metas': metas, 'cacheMaxAge': 30, 'staleRevalidate': 0, 'staleError': 0})
 
 

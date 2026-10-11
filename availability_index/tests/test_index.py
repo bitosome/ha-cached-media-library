@@ -40,7 +40,8 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(len(first), 100)
         self.assertEqual(len(second), 10)
         self.assertFalse(set(x['id'] for x in first) & set(x['id'] for x in second))
-        self.assertEqual(self.s.catalog('movie', 'cached-search', search='Movie 2', now=1001)[0]['name'], 'Movie 21')
+        self.assertEqual(self.s.catalog('movie', 'cached-search', search='Movie 2', now=1001), [])
+        self.assertEqual(self.s.catalog('movie', 'cached-search', search='Movie 21', now=1001)[0]['name'], 'Movie 21')
 
     def test_failure_does_not_extend_positive_and_policy_invalidates(self):
         self.add()
