@@ -117,6 +117,28 @@ class SearchAppTests(unittest.TestCase):
         self.assertEqual(chosen[3], 'tt1234567')
         self.assertEqual(self.app.store.catalog('movie', 'cached-search', search='Puss in Boots'), [])
 
+    def test_search_dispatch_does_not_scan_the_episode_backlog(self):
+        self.app.store.add_categories([{'type': 'series', 'id': 'many', 'name': 'Many'}], 'cachedlibrary')
+        cat = self.app.store.db.execute("SELECT * FROM categories WHERE search_only=0").fetchone()
+        self.app.store.add_page(cat, [{'id': 'tt'+str(i), 'name': 'Series '+str(i)} for i in range(2000)], 0, 2000)
+        self.app.store.db.executemany('''INSERT INTO checks(type,id,parent)
+          VALUES ('series',?,?)''', ((f'tt{i}:1:{episode}', 'tt'+str(i))
+                                    for i in range(2000) for episode in range(100)))
+        self.app.store.db.commit()
+        self.app.discover_search('movie', 'Puss in Boots')
+        self.app.check_dispatches = 3
+        # A VM instruction budget is deterministic across slow/fast hosts. A
+        # global due-episode join exceeds it; parent-first indexed lookups don't.
+        calls = [0]
+        def progress():
+            calls[0] += 1
+            return int(calls[0] > 1000)
+        self.app.store.db.set_progress_handler(progress, 1000)
+        try:
+            self.assertEqual(self.app.next_check('movie')['id'], 'tt1234567')
+        finally:
+            self.app.store.db.set_progress_handler(None, 0)
+
     def test_interest_does_not_bypass_provider_retry_deadline(self):
         self.app.discover_search('movie', 'Puss in Boots')
         self.app.store.db.execute('UPDATE checks SET due=?', (time.time() + 3600,))

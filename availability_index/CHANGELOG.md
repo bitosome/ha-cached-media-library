@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.2
+
+- Bound foreground check scheduling by parent before looking up episodes. Avoid
+  a global episode/title join that blocks browsing on large availability indexes.
+
+
 ## 0.9.1
 
 - Reserve one in four check dispatch opportunities for explicit search/detail
