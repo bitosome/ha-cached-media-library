@@ -218,6 +218,7 @@ class NativeMetadataStoreTests(unittest.TestCase):
         self.assertEqual(self.store.identity_conflicts, {('series', 'tt7678620')})
         grown = {'id': 'tt7678620', 'name': 'Bluey', 'videos': self.videos('tt7678620', 7)}
         self.store.save_meta('series', 'tt7678620', grown, self.now + 6, keep_identity=True)
+        self.assertEqual(self.store.identity_conflicts, set())  # Resolved once a list matches.
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM checks').fetchone()[0], 7)
         self.assertEqual(self.store.db.execute(
             "SELECT status FROM checks WHERE id='tt7678620:1:1'").fetchone()[0], 'available')
@@ -264,6 +265,14 @@ class NativeMetadataAppTests(unittest.TestCase):
         row = self.app.store.db.execute('SELECT meta,meta_due FROM titles').fetchone()
         self.assertEqual(row['meta'], stored)
         self.assertGreater(row['meta_due'], time.time() + 80000)
+
+    def test_identity_outside_tmdb_keeps_the_source_profile_provider(self):
+        self.app.tmdb_meta._fetch = lambda path, params: self.fail('TMDB cannot address ' + path)
+        seen = []
+        self.app.request = lambda path, **kwargs: seen.append((path, kwargs)) or {'meta': None}
+        self.app.fetch_meta('series', 'kitsu:12')
+        self.assertEqual(seen, [('/meta/series/kitsu%3A12.json', {'catalog': True})])
+        self.assertEqual(self.app.metadata_errors, 0)
 
     def test_without_a_credential_the_source_profile_is_still_used(self):
         temp = tempfile.TemporaryDirectory()

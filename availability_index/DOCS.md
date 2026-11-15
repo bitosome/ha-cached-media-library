@@ -121,8 +121,10 @@ Titles are addressed by their indexed IMDb (`tt…`) or `tmdb:<id>` identity.
 Episodes keep the `<series id>:<season>:<episode>` identity the stream checks
 use, following TMDB's season and episode numbering. If TMDB's episode list shares
 no identity with a show's existing checks, the list is refused and counted as
-`metadata.identity_conflicts` in `/status`, so confirmations are never silently
-discarded. A TMDB outage keeps stored metadata and retries after 30 minutes; a
+`metadata.identity_conflicts` in `/status` (titles are named in
+`identity_conflict_titles`), so confirmations are never silently discarded.
+Identities TMDB cannot address, such as `kitsu:` entries of a curated source
+list, still use the source profile's provider for that namespace. A TMDB outage keeps stored metadata and retries after 30 minutes; a
 title unknown to TMDB is retried daily and keeps its catalogue preview.
 
 The rating shown comes from TMDB's user score. Leave `tmdb_api_key` empty to keep

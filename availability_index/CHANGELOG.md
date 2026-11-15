@@ -13,7 +13,10 @@
   shelves and details immediately, and every title is refreshed in the background.
 - Treat a title TMDB does not know as absent for a day; transport errors keep the
   stored metadata and retry after 30 minutes.
-- `/status` reports the metadata provider, its error count and identity conflicts.
+- `/status` reports the metadata provider, its error count and identity conflicts,
+  naming up to 50 conflicting titles.
+- Titles whose identity is neither IMDb nor TMDB (for example `kitsu:` entries of a
+  curated source list) keep the source profile's provider for that namespace.
 - The rating shown is now TMDB's user score rather than an IMDb rating.
 
 ## 0.9.2

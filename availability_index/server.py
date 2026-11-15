@@ -698,6 +698,7 @@ class Store:
                                 (now + retry, kind, ident))
                 self.db.commit()
                 return
+            self.identity_conflicts.discard((kind, ident))
             meta = copy.deepcopy(meta)
             meta.pop('streams', None)
             # Retain translated names encountered in previous metadata responses.
@@ -1541,7 +1542,9 @@ class App:
             self.stop.wait(0.2)
 
     def fetch_meta(self, kind, ident):
-        if self.tmdb_meta is None:
+        # Identities TMDB cannot address (for example a curated source list's
+        # kitsu: ids) keep the source profile's own provider for that namespace.
+        if self.tmdb_meta is None or not re.fullmatch(r'tt\d{7,12}|tmdb:[1-9]\d{0,17}', ident):
             try:
                 result = self.request('/meta/' + kind + '/' + quote(ident, safe='') + '.json', catalog=True)
                 self.store.save_meta(kind, ident, result.get('meta'), time.time())
@@ -1761,7 +1764,11 @@ class Handler(BaseHTTPRequestHandler):
                                     'local_catalogs': len(app.tmdb.manifest_catalogs()) if app.tmdb else 0},
                       'metadata': {'provider': 'direct-tmdb' if app.tmdb_meta else 'source-profile',
                                    'errors': app.metadata_errors,
-                                   'identity_conflicts': len(app.store.identity_conflicts)},
+                                   'identity_conflicts': len(app.store.identity_conflicts),
+                                   # Shows whose TMDB episode numbering shares nothing with
+                                   # their existing checks; their stored episodes are kept.
+                                   'identity_conflict_titles': sorted(
+                                       k + ':' + i for k, i in list(app.store.identity_conflicts))[:50]},
                       'worker_errors': app.worker_errors,
                       'workers_alive': {k: v.is_alive() for k,v in app.threads.items()},
                       'worker_ages': {k: round(time.time() - v) for k, v in app.heartbeats.items()}, **app.store.status()}
