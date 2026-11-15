@@ -28,6 +28,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 from urllib.request import Request, urlopen
 
 from tmdb_discovery import TMDBDiscovery
+from tmdb_metadata import TMDBClient, TMDBError, TMDBMetadata, TMDBNotFound
 from search_matching import search_score
 
 # Include new/unknown settings conservatively. An allow-list of a few filters
@@ -54,6 +55,15 @@ def encode(value):
 
 def folded(value):
     return unicodedata.normalize('NFKC', value).casefold().replace('ё', 'е')
+
+
+def error_meta(meta):
+    """AIOStreams answers a failed metadata provider with a placeholder card
+    (name "[❌] <provider>"). It is a transport error, never a title's metadata."""
+    if not isinstance(meta, dict):
+        return False
+    name = meta.get('name')
+    return isinstance(name, str) and name.lstrip().startswith('[\u274c]')
 
 
 def playable(stream):
@@ -179,6 +189,7 @@ class Store:
         self.path, self.positive, self.negative, self.max_episodes = path, positive, negative, max_episodes
         self.catalog_refresh = catalog_refresh
         self.lock = threading.RLock()
+        self.identity_conflicts = set()
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript('''
@@ -653,7 +664,10 @@ class Store:
             self.db.commit()
             return True
 
-    def save_meta(self, kind, ident, meta, now):
+    def save_meta(self, kind, ident, meta, now, retry=1800, keep_identity=False):
+        """Store fetched metadata. `keep_identity` (native metadata) refuses an
+        episode list that shares no id with a show's existing checks, so a
+        numbering mismatch cannot silently discard every confirmation."""
         with self.lock:
             title = self.db.execute('''SELECT * FROM titles t WHERE type=? AND id=? AND EXISTS
               (SELECT 1 FROM membership m JOIN categories c ON c.id=m.category
@@ -661,7 +675,8 @@ class Store:
             if title is None:
                 return
             videos = []
-            valid = isinstance(meta, dict) and isinstance(meta.get('id'), str) and bool(meta['id'])
+            valid = (isinstance(meta, dict) and isinstance(meta.get('id'), str) and bool(meta['id'])
+                     and not error_meta(meta))
             if valid and kind == 'series':
                 listed = meta.get('videos')
                 valid = isinstance(listed, list) and all(isinstance(v, dict) for v in listed)
@@ -670,11 +685,17 @@ class Store:
                                      and isinstance(v.get('released'), str) and aired(v, now)),
                                     key=lambda v: (v['season'] == 0, v['season'], v['episode'], v['id']))
                     valid = bool(videos)
+                if valid and keep_identity:
+                    existing = {r['id'] for r in self.db.execute(
+                        'SELECT id FROM checks WHERE type=? AND parent=?', (kind, ident)).fetchall()}
+                    if len(existing) >= 4 and not existing.intersection(v['id'] for v in videos):
+                        self.identity_conflicts.add((kind, ident))
+                        valid = False
             if not valid:
                 # Empty/malformed metadata is not evidence that existing episodes
                 # disappeared. Keep both previous metadata and check results.
                 self.db.execute('UPDATE titles SET meta_due=?,meta_claimed=0 WHERE type=? AND id=?',
-                                (now + 1800, kind, ident))
+                                (now + retry, kind, ident))
                 self.db.commit()
                 return
             meta = copy.deepcopy(meta)
@@ -703,6 +724,53 @@ class Store:
                         self.db.rollback()
                         raise
             self.db.commit()
+
+    def tmdb_hint(self, kind, ident):
+        """A TMDB id already recorded for this title, or None. Only a hint: the
+        metadata adapter confirms it against the requested identity."""
+        with self.lock:
+            row = self.db.execute('SELECT preview,meta FROM titles WHERE type=? AND id=?', (kind, ident)).fetchone()
+            if row is None:
+                return None
+            for raw in (row['preview'], row['meta']):
+                try:
+                    document = json.loads(raw or '{}')
+                except ValueError:
+                    continue
+                if not isinstance(document, dict) or error_meta(document):
+                    continue
+                for field in ('tmdbId', 'tmdb_id'):
+                    value = document.get(field)
+                    if isinstance(value, (int, str)) and not isinstance(value, bool) and re.fullmatch(r'[1-9]\d{0,17}', str(value)):
+                        return int(value)
+            if re.fullmatch(r'tt\d+', ident):
+                rows = self.db.execute('SELECT tmdb_id FROM tmdb_ids WHERE kind=? AND imdb_id=? LIMIT 2',
+                                       (kind, ident)).fetchall()
+                if len(rows) == 1:
+                    return rows[0]['tmdb_id']
+            return None
+
+    def refresh_all_metadata(self, marker):
+        """Queue one metadata refresh of every title, provider error cards first.
+        Stored metadata and confirmations stay in place until replaced."""
+        with self.lock:
+            if self.setting(marker) is not None:
+                return 0
+            poisoned = 0
+            # Series metadata can be megabytes; only parse rows carrying the marker.
+            for row in self.db.execute("SELECT type,id,meta FROM titles WHERE instr(meta, '\u274c')>0 OR instr(meta, '\\u274c')>0").fetchall():
+                try:
+                    bad = error_meta(json.loads(row['meta']))
+                except ValueError:
+                    bad = True
+                if bad:
+                    self.db.execute('UPDATE titles SET meta=NULL,meta_checked=0 WHERE type=? AND id=?',
+                                    (row['type'], row['id']))
+                    poisoned += 1
+            self.db.execute('UPDATE titles SET meta_due=0,meta_claimed=0')
+            self.db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', (marker, encode(time.time())))
+            self.db.commit()
+            return poisoned
 
     @staticmethod
     def _explicit_imdb(preview, meta, parent):
@@ -932,6 +1000,8 @@ class Store:
             for row in rows:
                 preview = json.loads(row['preview'])
                 meta = json.loads(row['meta'] or '{}')
+                if error_meta(meta):
+                    meta = {}
                 genres = sorted(set(x for x in (preview.get('genres') or []) + (meta.get('genres') or []) if isinstance(x, str)))
                 if genre and genre not in genres:
                     continue
@@ -983,6 +1053,8 @@ class Store:
             if not row:
                 return None
             meta = json.loads(row['meta'] or row['preview'])
+            if error_meta(meta):
+                meta = json.loads(row['preview'])
             # Providers may answer an IMDb request with a TMDB parent id (or
             # vice versa). Jellyfin derives season ids from this field, so the
             # outgoing parent must match the indexed/search id. Retain the
@@ -1081,6 +1153,16 @@ class App:
                                       language=options.get('tmdb_language', 'en-US'),
                                       resolve_identity=self.resolve_tmdb_identity)
             self.store.seed_tmdb_identities(time.time())
+        # With a TMDB credential, title and episode metadata comes straight
+        # from TMDB's API; no hosted metadata add-on is consulted.
+        self.tmdb_meta = None
+        if (options.get('tmdb_api_key') or '').strip():
+            self.tmdb_meta = TMDBMetadata(TMDBClient(options['tmdb_api_key']).fetch,
+                                          language=options.get('tmdb_language') or 'en-US')
+            cleared = self.store.refresh_all_metadata('native_metadata_v1')
+            if cleared:
+                print('Discarded ' + str(cleared) + ' provider error cards stored as metadata', flush=True)
+        self.metadata_errors = 0
         self.ready = False
         self.error = 'Initialising'
         self.provider_errors_visible = False
@@ -1455,12 +1537,29 @@ class App:
             if row is None:
                 self.stop.wait(5)
                 continue
-            try:
-                result = self.request('/meta/' + row['type'] + '/' + quote(row['id'], safe='') + '.json', catalog=True)
-                self.store.save_meta(row['type'], row['id'], result.get('meta'), time.time())
-            except Exception:
-                self.store.save_meta(row['type'], row['id'], None, time.time())
+            self.fetch_meta(row['type'], row['id'])
             self.stop.wait(0.2)
+
+    def fetch_meta(self, kind, ident):
+        if self.tmdb_meta is None:
+            try:
+                result = self.request('/meta/' + kind + '/' + quote(ident, safe='') + '.json', catalog=True)
+                self.store.save_meta(kind, ident, result.get('meta'), time.time())
+            except Exception:
+                self.store.save_meta(kind, ident, None, time.time())
+            return
+        try:
+            meta, tmdb_id = self.tmdb_meta.meta(kind, ident, self.store.tmdb_hint(kind, ident))
+            imdb = meta.get('imdb_id')
+            if isinstance(imdb, str) and re.fullmatch(r'tt\d+', imdb):
+                self.store.set_tmdb_identity(kind, tmdb_id, imdb, time.time() + 604800)
+            self.store.save_meta(kind, ident, meta, time.time(), keep_identity=True)
+        except TMDBNotFound:
+            # Authoritative absence: keep what is stored and look again tomorrow.
+            self.store.save_meta(kind, ident, None, time.time(), retry=86400)
+        except Exception:
+            self.metadata_errors += 1
+            self.store.save_meta(kind, ident, None, time.time())
 
     def next_check(self, preferred):
         with self.store.lock:
@@ -1660,6 +1759,9 @@ class Handler(BaseHTTPRequestHandler):
                       'recovery': app.store.setting('last_recovery'),
                       'discovery': {'provider': 'direct-tmdb' if app.tmdb else 'source-profile',
                                     'local_catalogs': len(app.tmdb.manifest_catalogs()) if app.tmdb else 0},
+                      'metadata': {'provider': 'direct-tmdb' if app.tmdb_meta else 'source-profile',
+                                   'errors': app.metadata_errors,
+                                   'identity_conflicts': len(app.store.identity_conflicts)},
                       'worker_errors': app.worker_errors,
                       'workers_alive': {k: v.is_alive() for k,v in app.threads.items()},
                       'worker_ages': {k: round(time.time() - v) for k, v in app.heartbeats.items()}, **app.store.status()}

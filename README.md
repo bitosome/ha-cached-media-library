@@ -29,7 +29,8 @@ configuration, need administrator credentials, store stream URLs, or proxy video
 1. It reads the playback profile to confirm cached-only filtering remains enforced.
    Changes to settings that affect stream acceptance invalidate stored verdicts.
 2. It builds configured discovery catalogues directly from TMDB, and reads other
-   catalogues and complete metadata from the separate source profile.
+   catalogues from the separate source profile. With a TMDB credential, title and
+   episode metadata is read directly from the official TMDB API.
    Keeping metadata independent prevents filtered episode lists feeding back into
    the scanner.
 3. It checks candidates against the playback profile's `/stream` endpoint.

@@ -23,7 +23,9 @@ Two separate AIOStreams profiles are required:
   must differ from the playback profile. Do not add Cached Media Library to this
   profile or hide its upstream catalogues.
 
-The source profile supplies complete candidate lists and episode metadata. Reading
+The source profile supplies complete candidate lists. Without a TMDB credential it
+also supplies episode metadata; with `tmdb_api_key` set, metadata comes directly
+from TMDB (see "Direct TMDB metadata"). Reading
 metadata back from the filtered playback profile would progressively restrict the
 scanner to the episodes it had already published. The app rejects incomplete or
 unsafe source configuration instead of relying on an old database to bootstrap.
@@ -48,7 +50,7 @@ URLs as credentials; avoid pasting them into public logs or issue reports.
 
 | Option | Description |
 | --- | --- |
-| `tmdb_api_key` | Optional TMDB v3 API key or Read Access Token for direct discovery. |
+| `tmdb_api_key` | TMDB v3 API key or Read Access Token for direct discovery and direct title/episode metadata. |
 | `tmdb_language` | Metadata language for direct discovery; default `en-US`. |
 | `tmdb_catalogs` | JSON array of local catalogue definitions; default `[]` disables direct discovery. |
 | `aiostreams_url` | AIOStreams base URL, for example `http://192.168.0.13:3000`. |
@@ -105,10 +107,26 @@ prefers local definitions for those IDs. Existing explicit TMDB/IMDb mappings
 seed a persistent cache; new mappings are resolved directly from TMDB. Mapping
 cache entries do not establish stream availability or extend confirmations.
 
-The separate source profile is still required for complete episode metadata and
-any other catalogues, including curated family selections. Its metadata provider
-must remain enabled; replacing discovery does not replace every AIOStreams
-metadata or stream provider. Do not add the filtered cache app to that profile.
+The separate source profile is still required for any other catalogues, including
+curated family selections. Do not add the filtered cache app to that profile.
+
+## Direct TMDB metadata (0.10.0)
+
+With `tmdb_api_key` set, title, season and episode metadata is read from the
+official `api.themoviedb.org` API inside this app, in `tmdb_language`. No hosted
+TMDB metadata add-on is used, and the one in the source profile can be removed.
+Local catalogue definitions are not required for this; the credential is enough.
+
+Titles are addressed by their indexed IMDb (`tt…`) or `tmdb:<id>` identity.
+Episodes keep the `<series id>:<season>:<episode>` identity the stream checks
+use, following TMDB's season and episode numbering. If TMDB's episode list shares
+no identity with a show's existing checks, the list is refused and counted as
+`metadata.identity_conflicts` in `/status`, so confirmations are never silently
+discarded. A TMDB outage keeps stored metadata and retries after 30 minutes; a
+title unknown to TMDB is retried daily and keeps its catalogue preview.
+
+The rating shown comes from TMDB's user score. Leave `tmdb_api_key` empty to keep
+reading metadata from the source profile's own metadata provider.
 
 Leave `tmdb_catalogs` as `[]` to retain the previous source-profile-only mode.
 The TMDB key stays in Home Assistant app options and is sent only to the official

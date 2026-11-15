@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.10.0
+
+- Read title, season and episode metadata directly from the official TMDB API
+  whenever `tmdb_api_key` is set. The source profile's hosted TMDB metadata
+  add-on is no longer consulted and can be removed from that profile.
+- Keep episode identities (`<series id>:<season>:<episode>`) unchanged, so existing
+  confirmations stay attached. An episode list sharing no identity with a show's
+  existing checks is refused and counted in `/status` instead of discarding them.
+- Never store an AIOStreams provider error card (`[❌] <provider>`) as metadata.
+  Cards stored by earlier versions are discarded once at start, hidden from
+  shelves and details immediately, and every title is refreshed in the background.
+- Treat a title TMDB does not know as absent for a day; transport errors keep the
+  stored metadata and retry after 30 minutes.
+- `/status` reports the metadata provider, its error count and identity conflicts.
+- The rating shown is now TMDB's user score rather than an IMDb rating.
+
 ## 0.9.2
 
 - Bound foreground check scheduling by parent before looking up episodes. Avoid

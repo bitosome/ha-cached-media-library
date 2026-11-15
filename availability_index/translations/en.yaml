@@ -2,7 +2,7 @@ configuration:
   tmdb_api_key:
     name: TMDB API key or Read Access Token
     description: >-
-      Optional credential for discovery directly from the official TMDB API.
+      Credential for discovery and for title and episode metadata read directly from the official TMDB API.
       Required when local TMDB catalogues are configured.
   tmdb_language:
     name: TMDB metadata language
