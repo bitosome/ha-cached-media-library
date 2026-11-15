@@ -92,6 +92,17 @@ released-only date cutoffs, sorting and scripted/miniseries filters. For scripte
 animation; it is not an age rating. Language affects metadata, not the language
 of available audio. Russian/English audio preferences remain in AIOStreams.
 
+Further selection filters (0.10.1), all validated strictly:
+
+| Filter | Meaning |
+| --- | --- |
+| `originalLanguages` / `excludeOriginalLanguages` | Lowercase two-letter original-language codes to keep or drop. Enforced on every returned title, so they also work for `now_playing`. |
+| `originCountries` | Uppercase two-letter origin countries (any of). |
+| `certificationCountry` + `certificationMax` | Movies only: at most this certification in that country, for example `US` and `PG`. TMDB has no such filter for series. |
+| `keywords` / `excludeKeywords` | TMDB keyword ids; `210024` is anime. |
+| `companies`, `networks` | TMDB company ids; network ids for series. |
+| `releasedBeforeDays` | Minimum age in days, so brand-new titles stay off a shelf meant for settled ones. Must be shorter than `releasedWithinDays`. |
+
 Keep catalogue IDs unchanged when editing filters. The app detects changes to
 local definitions or metadata language and starts one new crawl while retaining
 existing confirmations. Only candidates passing the normal AIOStreams checks

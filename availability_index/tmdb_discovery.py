@@ -45,14 +45,23 @@ def _numbers(value, minimum=1, maximum=100000):
             and all(_integer(item, minimum) and item <= maximum for item in value))
 
 
+def _codes(value, pattern):
+    return (isinstance(value, list) and 0 < len(value) <= 20 and len(set(map(str, value))) == len(value)
+            and all(isinstance(item, str) and re.fullmatch(pattern, item) for item in value))
+
+
 class TMDBDiscovery:
     PAGE_SIZE = 20
     MAX_PAGE = 500
     FILTERS = frozenset({'sortBy', 'imdbOnly', 'listType', 'includeAdult',
                          'releaseTypes', 'releasedOnly', 'voteCountMin',
                          'ratingMin', 'ratingMax', 'genres', 'excludeGenres',
-                         'genreMatchMode', 'tvType', 'releasedWithinDays', 'region'})
-    NOW_PLAYING_FILTERS = frozenset({'listType', 'includeAdult', 'releasedOnly', 'region'})
+                         'genreMatchMode', 'tvType', 'releasedWithinDays', 'region',
+                         'releasedBeforeDays', 'originalLanguages', 'excludeOriginalLanguages',
+                         'originCountries', 'certificationCountry', 'certificationMax',
+                         'keywords', 'excludeKeywords', 'companies', 'networks'})
+    NOW_PLAYING_FILTERS = frozenset({'listType', 'includeAdult', 'releasedOnly', 'region',
+                                     'originalLanguages', 'excludeOriginalLanguages'})
 
     def __init__(self, api_key, catalogs, language='en-US', request_json=None,
                  today=None, resolve_identity=None):
@@ -92,6 +101,11 @@ class TMDBDiscovery:
         list_type = filters.get('listType', 'discover')
         if list_type not in ('discover', 'now_playing'):
             raise ValueError('Unsupported TMDB list type')
+        for field in ('originalLanguages', 'excludeOriginalLanguages'):
+            if field in filters and not _codes(filters[field], r'[a-z]{2}'):
+                raise ValueError('TMDB original languages must be lowercase two-letter codes')
+        if set(filters.get('originalLanguages', ())) & set(filters.get('excludeOriginalLanguages', ())):
+            raise ValueError('A TMDB original language cannot be both included and excluded')
         for field in ('includeAdult', 'releasedOnly'):
             if field in filters and not isinstance(filters[field], bool):
                 raise ValueError('Invalid TMDB boolean filter')
@@ -116,6 +130,32 @@ class TMDBDiscovery:
                 raise ValueError('TMDB release window must be an integer from 1 to 3650 days')
             if not filters.get('releasedOnly', True):
                 raise ValueError('A TMDB release window requires releasedOnly')
+        if 'releasedBeforeDays' in filters:
+            days = filters['releasedBeforeDays']
+            if not _integer(days, 1) or days > 36500:
+                raise ValueError('TMDB minimum age must be an integer from 1 to 36500 days')
+            if not filters.get('releasedOnly', True):
+                raise ValueError('A TMDB minimum age requires releasedOnly')
+            if days >= filters.get('releasedWithinDays', days + 1):
+                raise ValueError('The TMDB minimum age must be shorter than the release window')
+        if 'originCountries' in filters and not _codes(filters['originCountries'], r'[A-Z]{2}'):
+            raise ValueError('TMDB origin countries must be uppercase two-letter codes')
+        if ('certificationCountry' in filters) != ('certificationMax' in filters):
+            raise ValueError('A TMDB certification limit needs both a country and a maximum')
+        if 'certificationCountry' in filters:
+            if value['type'] != 'movie':
+                raise ValueError('TMDB certification limits support movies only')
+            if (not isinstance(filters['certificationCountry'], str)
+                    or not re.fullmatch(r'[A-Z]{2}', filters['certificationCountry'])
+                    or not isinstance(filters['certificationMax'], str)
+                    or not re.fullmatch(r'[A-Za-z0-9+-]{1,10}', filters['certificationMax'])):
+                raise ValueError('Invalid TMDB certification limit')
+        for field in ('keywords', 'excludeKeywords', 'companies', 'networks'):
+            if field in filters and (not filters[field] or len(filters[field]) > 20
+                                     or not _numbers(filters[field], 1, 100000000)):
+                raise ValueError('TMDB keyword, company and network filters take 1 to 20 numeric ids')
+        if 'networks' in filters and value['type'] != 'series':
+            raise ValueError('TMDB network filters support series only')
         sorts = {'popularity.desc', 'popularity.asc', 'vote_average.desc', 'vote_average.asc',
                  'vote_count.desc', 'vote_count.asc'}
         sorts |= ({'primary_release_date.desc', 'primary_release_date.asc', 'title.asc', 'title.desc'}
@@ -226,10 +266,21 @@ class TMDBDiscovery:
                   'sort_by': filters.get('sortBy', 'popularity.desc'),
                   'include_adult': str(filters.get('includeAdult', False)).lower()}
         today = self._today() if filters.get('releasedOnly', True) else None
+        date_key = 'primary_release_date' if catalog['type'] == 'movie' else 'first_air_date'
         if 'releasedWithinDays' in filters:
             start = (date.fromisoformat(today) - timedelta(days=filters['releasedWithinDays'])).isoformat()
-            date_key = 'primary_release_date' if catalog['type'] == 'movie' else 'first_air_date'
             params[date_key + '.gte'] = start
+        for field, target, separator in (('originalLanguages', 'with_original_language', '|'),
+                                         ('originCountries', 'with_origin_country', '|'),
+                                         ('keywords', 'with_keywords', '|'),
+                                         ('excludeKeywords', 'without_keywords', ','),
+                                         ('companies', 'with_companies', '|'),
+                                         ('networks', 'with_networks', '|')):
+            if field in filters:
+                params[target] = separator.join(map(str, filters[field]))
+        if 'certificationCountry' in filters:
+            params['certification_country'] = filters['certificationCountry']
+            params['certification.lte'] = filters['certificationMax']
         for field, target in (('ratingMin', 'vote_average.gte'), ('ratingMax', 'vote_average.lte'),
                               ('voteCountMin', 'vote_count.gte')):
             if field in filters:
@@ -251,7 +302,23 @@ class TMDBDiscovery:
             if filters.get('releasedOnly', True):
                 params['first_air_date.lte'] = today
                 params['with_status'] = '0|3|4|5'
+        if 'releasedBeforeDays' in filters:
+            # A minimum age keeps brand-new titles off shelves meant for settled ones.
+            params[date_key + '.lte'] = (date.fromisoformat(today)
+                                         - timedelta(days=filters['releasedBeforeDays'])).isoformat()
         return params
+
+    @staticmethod
+    def _language_allowed(item, filters):
+        """Original-language selection, enforced locally as well: TMDB has no
+        exclusion parameter, and now-playing lists take no language filter."""
+        include, exclude = filters.get('originalLanguages'), filters.get('excludeOriginalLanguages')
+        if not include and not exclude:
+            return True
+        language = item.get('original_language') if isinstance(item, dict) else None
+        if not isinstance(language, str) or not re.fullmatch(r'[a-z]{2}', language):
+            raise TMDBError('TMDB returned an invalid catalogue item')
+        return (not include or language in include) and language not in (exclude or ())
 
     def _preview(self, kind, item):
         if not isinstance(item, dict) or not _integer(item.get('id'), 1):
@@ -401,9 +468,11 @@ class TMDBDiscovery:
         total_pages = response['total_pages']
         complete = page >= min(total_pages, self.MAX_PAGE)
         selected = items[offset % self.PAGE_SIZE:]
-        if definition.get('filters', {}).get('listType') == 'now_playing':
+        filters = definition.get('filters', {})
+        if filters.get('listType') == 'now_playing':
             today = date.fromisoformat(self._today())
             selected = [item for item in selected if self._released_cinema_item(item, today)]
+        selected = [item for item in selected if self._language_allowed(item, filters)]
         previews = [self._preview(kind, item) for item in selected]
         # Filtering must never change the upstream cursor or completion signal:
         # a page containing only future releases is not an empty source page.

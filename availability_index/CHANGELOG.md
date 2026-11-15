@@ -9,6 +9,11 @@
   the other confirmations. These shows keep their stored episodes and are named
   in `/status` under `metadata.identity_conflict_titles`; they are looked at
   again daily. Removed episodes (up to 10%) and changed specials stay ordinary updates.
+- New shelf selection filters for `tmdb_catalogs`: `originalLanguages`,
+  `excludeOriginalLanguages`, `originCountries`, `certificationCountry` with
+  `certificationMax` (movies), `keywords`, `excludeKeywords`, `companies`,
+  `networks` (series) and `releasedBeforeDays` (minimum age). Existing
+  definitions behave as before; nothing changes until a definition uses them.
 
 ## 0.10.0
 
