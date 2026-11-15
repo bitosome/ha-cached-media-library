@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.10.1
+
+- Refuse a TMDB episode list that numbers a show differently from its existing
+  checks, not only one sharing no episode at all. TMDB lays some shows (mostly
+  long anime) out in other seasons than the IMDb-style numbering stream providers
+  use; 0.10.0 accepted such lists when a few episodes happened to match, deleting
+  the other confirmations. These shows keep their stored episodes and are named
+  in `/status` under `metadata.identity_conflict_titles`; they are looked at
+  again daily. Removed episodes (up to 10%) and changed specials stay ordinary updates.
+
 ## 0.10.0
 
 - Read title, season and episode metadata directly from the official TMDB API

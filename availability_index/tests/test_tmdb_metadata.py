@@ -9,7 +9,7 @@ from unittest.mock import Mock
 from urllib.error import HTTPError
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from server import App, Store, error_meta
+from server import renumbered, App, Store, error_meta
 from tmdb_metadata import TMDBClient, TMDBError, TMDBMetadata, TMDBNotFound
 
 
@@ -222,6 +222,31 @@ class NativeMetadataStoreTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM checks').fetchone()[0], 7)
         self.assertEqual(self.store.db.execute(
             "SELECT status FROM checks WHERE id='tt7678620:1:1'").fetchone()[0], 'available')
+
+
+    def test_other_season_layout_keeps_existing_episodes_and_confirmations(self):
+        # Existing IMDb-style layout: two seasons of 8. TMDB offers one season of 16.
+        old = self.videos('tt0388629', 8) + [dict(v, id=v['id'].replace(':1:', ':2:'), season=2)
+                                              for v in self.videos('tt0388629', 8)]
+        self.add('series', {'id': 'tt0388629', 'name': 'One Piece'})
+        self.store.save_meta('series', 'tt0388629', {'id': 'tt0388629', 'name': 'One Piece', 'videos': old}, self.now)
+        self.store.record('series', 'tt0388629:2:3', 'tt0388629', 'available', 2, self.now)
+        before = [tuple(r) for r in self.store.db.execute('SELECT * FROM checks ORDER BY id')]
+        stored = self.store.db.execute('SELECT meta FROM titles').fetchone()['meta']
+        flat = {'id': 'tt0388629', 'name': 'One Piece', 'videos': self.videos('tt0388629', 16)}
+        self.store.save_meta('series', 'tt0388629', flat, self.now + 5, keep_identity=True)
+        self.assertEqual(before, [tuple(r) for r in self.store.db.execute('SELECT * FROM checks ORDER BY id')])
+        row = self.store.db.execute('SELECT meta,meta_due FROM titles').fetchone()
+        self.assertEqual(row['meta'], stored)
+        self.assertGreater(row['meta_due'], self.now + 80000)  # Daily, not every 30 minutes.
+        self.assertEqual(self.store.identity_conflicts, {('series', 'tt0388629')})
+
+    def test_a_few_removed_episodes_and_changed_specials_are_an_ordinary_update(self):
+        self.assertFalse(renumbered({'a:1:%d' % n for n in range(1, 41)} | {'a:0:1', 'a:0:2', 'a:0:3', 'a:0:4', 'a:0:5'},
+                                    {'a:1:%d' % n for n in range(1, 38)}))   # 3 of 40 gone, specials gone
+        self.assertTrue(renumbered({'a:1:%d' % n for n in range(1, 41)}, {'a:1:%d' % n for n in range(1, 36)}))
+        self.assertFalse(renumbered({'a:1:1', 'a:1:2'}, {'b:1:1'}))            # Too little evidence.
+        self.assertTrue(renumbered({'a:0:%d' % n for n in range(1, 6)}, {'b:0:1'}))
 
 
 class NativeMetadataAppTests(unittest.TestCase):

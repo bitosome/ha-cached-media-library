@@ -66,6 +66,22 @@ def error_meta(meta):
     return isinstance(name, str) and name.lstrip().startswith('[\u274c]')
 
 
+def renumbered(existing, offered):
+    """True when an offered episode list numbers a show differently from its
+    existing checks. Stream providers address episodes by IMDb-style season and
+    episode; TMDB lays some shows (mostly long anime) out in other seasons or
+    with absolute numbers. Accepting such a list would delete confirmations and
+    check episodes under identities the providers do not use. A few removed
+    episodes, and any change to specials (season 0), remain an ordinary update."""
+    if len(existing) < 4:
+        return False
+    if not existing & offered:
+        return True
+    regular = {i for i in existing if not re.search(r':0:\d+$', i)}
+    missing = len(regular - offered)
+    return len(regular) >= 4 and missing > max(3, len(regular) // 10)
+
+
 def playable(stream):
     # AIOStreams can give information videos HTTP URLs, so a URL alone is not
     # enough. Its structured streamData identifies these independently of labels.
@@ -688,9 +704,11 @@ class Store:
                 if valid and keep_identity:
                     existing = {r['id'] for r in self.db.execute(
                         'SELECT id FROM checks WHERE type=? AND parent=?', (kind, ident)).fetchall()}
-                    if len(existing) >= 4 and not existing.intersection(v['id'] for v in videos):
+                    if renumbered(existing, {v['id'] for v in videos}):
                         self.identity_conflicts.add((kind, ident))
                         valid = False
+                        # The season layout will not change by itself; look again daily.
+                        retry = max(retry, 86400)
             if not valid:
                 # Empty/malformed metadata is not evidence that existing episodes
                 # disappeared. Keep both previous metadata and check results.

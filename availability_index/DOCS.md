@@ -119,10 +119,14 @@ Local catalogue definitions are not required for this; the credential is enough.
 
 Titles are addressed by their indexed IMDb (`tt…`) or `tmdb:<id>` identity.
 Episodes keep the `<series id>:<season>:<episode>` identity the stream checks
-use, following TMDB's season and episode numbering. If TMDB's episode list shares
-no identity with a show's existing checks, the list is refused and counted as
+use, following TMDB's season and episode numbering. If TMDB's episode list
+numbers a show differently from its existing checks (no shared episode, or more
+than 10% of its regular episodes missing), the list is refused and counted as
 `metadata.identity_conflicts` in `/status` (titles are named in
 `identity_conflict_titles`), so confirmations are never silently discarded.
+Such shows, mostly long anime that TMDB lays out in other seasons than the
+IMDb-style numbering stream providers use, keep their stored episode list and
+do not receive new episodes until the numbering is reconciled.
 Identities TMDB cannot address, such as `kitsu:` entries of a curated source
 list, still use the source profile's provider for that namespace. A TMDB outage keeps stored metadata and retries after 30 minutes; a
 title unknown to TMDB is retried daily and keeps its catalogue preview.
