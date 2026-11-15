@@ -54,6 +54,16 @@ class NativeDiscoveryAppTests(unittest.TestCase):
         self.assertEqual(before, tuple(self.app.store.db.execute('SELECT * FROM checks').fetchone()))
         self.assertEqual(len(self.app.upstream_catalogs()), 2)
 
+    def test_retired_local_shelf_is_not_read_from_the_source_profile(self):
+        self.app.synchronize()
+        shelf = self.remote_catalogs[1]
+        self.assertIn(shelf['id'], [c['id'] for c in self.app.upstream_catalogs()])
+        self.app.tmdb._retired.add((shelf['type'], shelf['id']))
+        self.assertNotIn(shelf['id'], [c['id'] for c in self.app.upstream_catalogs()])
+        self.app.synchronize()
+        row = self.app.store.db.execute('SELECT active FROM categories WHERE upstream=?', (shelf['id'],)).fetchone()
+        self.assertEqual(row['active'], 0)
+
     def test_empty_source_manifest_does_not_retire_curated_shelves(self):
         self.app.synchronize()
         before = [tuple(row) for row in self.app.store.db.execute('SELECT * FROM categories')]

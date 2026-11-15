@@ -74,6 +74,20 @@ class ShelfFilterTests(unittest.TestCase):
             self.adapter(definition(excludeOriginalLanguages=['ja']), Mock(return_value=broken)).catalog('movie', 'shelf.movie')
         self.assertEqual(len(self.adapter(definition(), Mock(return_value=broken)).catalog('movie', 'shelf.movie')['metas']), 1)
 
+    def test_retired_shelf_is_claimed_but_never_published_or_crawled(self):
+        gone = {'id': 'old.shelf', 'type': 'movie', 'name': 'Fantasy Movies', 'retired': True}
+        adapter = TMDBDiscovery('a' * 32, [definition(), gone], request_json=Mock())
+        self.assertEqual([c['id'] for c in adapter.manifest_catalogs()], ['shelf.movie'])
+        self.assertEqual(adapter.claimed(), {('movie', 'shelf.movie'), ('movie', 'old.shelf')})
+        self.assertFalse(adapter.has_catalog('movie', 'old.shelf'))
+        with self.assertRaises(ValueError):
+            adapter.catalog('movie', 'old.shelf')
+        for bad in ([gone], [definition(), gone, dict(gone)], [definition(), dict(gone, retired='yes')],
+                    [dict(definition(), surprise=1)]):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                TMDBDiscovery('a' * 32, bad, request_json=Mock())
+
+
     def test_invalid_selection_filters_fail_configuration(self):
         bad = [dict(originalLanguages=['EN']), dict(originalLanguages=[]), dict(excludeOriginalLanguages='ja'),
                dict(originalLanguages=['en'], excludeOriginalLanguages=['en']), dict(originalLanguages=['en', 'en']),

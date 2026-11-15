@@ -14,6 +14,9 @@
   `certificationMax` (movies), `keywords`, `excludeKeywords`, `companies`,
   `networks` (series) and `releasedBeforeDays` (minimum age). Existing
   definitions behave as before; nothing changes until a definition uses them.
+- A definition with `"retired": true` (id, type and name only) retires a shelf
+  explicitly: it is published nowhere and is no longer read from the source
+  profile under the same id.
 
 ## 0.10.0
 

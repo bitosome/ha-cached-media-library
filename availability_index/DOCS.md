@@ -103,6 +103,10 @@ Further selection filters (0.10.1), all validated strictly:
 | `companies`, `networks` | TMDB company ids; network ids for series. |
 | `releasedBeforeDays` | Minimum age in days, so brand-new titles stay off a shelf meant for settled ones. Must be shorter than `releasedWithinDays`. |
 
+To remove a shelf, keep its definition as `{"id": "...", "type": "...", "name": "...", "retired": true}`.
+Deleting the definition instead hands the id back to the source profile, which
+publishes the shelf again if it still lists a catalogue with that id.
+
 Keep catalogue IDs unchanged when editing filters. The app detects changes to
 local definitions or metadata language and starts one new crawl while retaining
 existing confirmations. Only candidates passing the normal AIOStreams checks

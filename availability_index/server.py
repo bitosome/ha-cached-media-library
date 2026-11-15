@@ -1279,7 +1279,7 @@ class App:
             # Definitions are local and remain available even if TMDB is down.
             # Reuse source IDs so Infuse libraries and confirmations survive.
             local = self.tmdb.manifest_catalogs()
-            keys = {(c['type'], c['id']) for c in local}
+            keys = self.tmdb.claimed()
             catalogs = local + [c for c in catalogs if (c['type'], c['id']) not in keys]
         return catalogs
 

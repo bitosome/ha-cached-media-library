@@ -81,12 +81,18 @@ class TMDBDiscovery:
         self._resolve_identity = resolve_identity
         self._identities = {}
         self._catalogs = {}
+        self._retired = set()
         for definition in catalogs:
             self._validate_catalog(definition)
             key = (definition['type'], definition['id'])
-            if key in self._catalogs:
+            if key in self._catalogs or key in self._retired:
                 raise ValueError('Duplicate TMDB catalogue identity')
-            self._catalogs[key] = copy.deepcopy(definition)
+            if definition.get('retired', False):
+                self._retired.add(key)
+            else:
+                self._catalogs[key] = copy.deepcopy(definition)
+        if not self._catalogs:
+            raise ValueError('At least one TMDB catalogue must not be retired')
 
     @classmethod
     def _validate_catalog(cls, value):
@@ -95,6 +101,8 @@ class TMDBDiscovery:
         for field in ('id', 'name'):
             if not isinstance(value.get(field), str) or not value[field].strip() or len(value[field]) > 250:
                 raise ValueError('Invalid TMDB catalogue identity or name')
+        if set(value) - {'id', 'type', 'name', 'filters', 'retired'} or not isinstance(value.get('retired', False), bool):
+            raise ValueError('Unsupported TMDB catalogue definition')
         filters = value.get('filters', {})
         if not isinstance(filters, dict) or set(filters) - cls.FILTERS:
             raise ValueError('Unsupported TMDB catalogue filters')
@@ -184,6 +192,12 @@ class TMDBDiscovery:
     def manifest_catalogs(self):
         return [{'id': catalog['id'], 'type': catalog['type'], 'name': catalog['name'],
                  'extra': [{'name': 'skip'}]} for catalog in self._catalogs.values()]
+
+    def claimed(self):
+        """Identities owned by local definitions, including retired shelves. A
+        retired shelf is published nowhere and is never read from the source
+        profile under the same identity."""
+        return set(self._catalogs) | self._retired
 
     def has_catalog(self, kind, ident):
         return (kind, ident) in self._catalogs
