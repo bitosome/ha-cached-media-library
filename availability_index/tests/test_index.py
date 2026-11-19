@@ -7,7 +7,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-from server import App, Store, aired, episode_order, is_scanner_catalog, policy_fingerprint, stream_verdict
+from server import App, Store, aired, is_scanner_catalog, series_probes, policy_fingerprint, stream_verdict
 
 import time
 
@@ -59,20 +59,19 @@ class IndexTests(unittest.TestCase):
         self.s.record('movie', 'tt0000001', 'tt0000001', 'unavailable', 0, 1000)
         self.assertEqual(self.s.catalog('movie', self.cat['id'], now=1001), [])
 
-    def test_series_only_confirmed_aired_episodes(self):
+    def test_confirmed_series_lists_every_aired_episode(self):
         self.s.add_categories([{'id': 'upstream.shows', 'type': 'series', 'name': 'Shows'}], 'cachedlibrary')
         cat = self.s.db.execute("SELECT * FROM categories WHERE type='series'").fetchone()
         self.s.add_page(cat, [{'id': 'tt123', 'name': 'Ёжик'}], 0, 100)
         videos = [{'id': 'tt123:1:%d' % i, 'season': 1, 'episode': i, 'released': PAST} for i in range(1, 4)]
         videos.append({'id': 'tt123:1:4', 'season': 1, 'episode': 4, 'released': FUTURE})
         self.s.save_meta('series', 'tt123', {'id': 'tt123', 'name': 'Ёжик', 'type': 'series', 'videos': videos}, NOW)
-        # Unaired episodes are never queued; every aired episode remains a candidate.
-        self.assertEqual(self.s.db.execute('SELECT count(*) FROM checks').fetchone()[0], 3)
-        self.assertEqual(self.s.db.execute('SELECT count(*) FROM checks WHERE id=?', ('tt123:1:4',)).fetchone()[0], 0)
+        # One season: its opener is the only check. Unaired episodes are never listed.
+        self.assertEqual([r[0] for r in self.s.db.execute('SELECT id FROM checks')], ['tt123:1:1'])
         self.assertIsNone(self.s.meta('series', 'tt123', NOW + 1))
-        self.s.record('series', 'tt123:1:2', 'tt123', 'available', 1, NOW)
+        self.s.record('series', 'tt123:1:1', 'tt123', 'available', 1, NOW)
         meta = self.s.meta('series', 'tt123', NOW + 1)
-        self.assertEqual([v['id'] for v in meta['videos']], ['tt123:1:2'])
+        self.assertEqual([v['id'] for v in meta['videos']], ['tt123:1:1', 'tt123:1:2', 'tt123:1:3'])
         self.assertEqual(len(self.s.catalog('series', 'cached-search', search='ежик', now=NOW + 1)), 1)
 
     def test_known_categories_survive_switchover(self):
@@ -104,11 +103,15 @@ class IndexTests(unittest.TestCase):
         self.assertEqual(policy_fingerprint(base), policy_fingerprint(dict(base, sortCriteria={'global': [{'key': 'x'}]})))
         self.assertNotEqual(policy_fingerprint(base), policy_fingerprint(dict(base, excludeUncached=False)))
 
-    def test_episode_order_prefers_newest_season_openers(self):
-        videos = [{'season': 1, 'episode': 5}, {'season': 2, 'episode': 1}, {'season': 1, 'episode': 1}, {'season': 2, 'episode': 4}]
-        self.assertEqual([(v['season'], v['episode']) for v in sorted(videos, key=episode_order)], [(2, 1), (1, 1), (2, 4), (1, 5)])
+    def test_series_probes_newest_then_first_season_opener(self):
+        def v(s, e):
+            return {'id': 'x:%d:%d' % (s, e), 'season': s, 'episode': e}
+        self.assertEqual(series_probes([v(1, 1), v(1, 2), v(2, 1), v(3, 2), v(3, 3), v(0, 1)]), ['x:3:2', 'x:1:1'])
+        self.assertEqual(series_probes([v(1, 1), v(1, 2)]), ['x:1:1'])
+        self.assertEqual(series_probes([v(0, 2), v(0, 1)]), ['x:0:1'])  # Specials only when nothing else.
+        self.assertEqual(series_probes([]), [])
 
-    def test_series_priorities_probe_newest_seasons_first(self):
+    def test_series_checks_are_its_two_probes(self):
         self.s.add_categories([{'id': 'upstream.shows', 'type': 'series', 'name': 'Shows'}], 'cachedlibrary')
         cat = self.s.db.execute("SELECT * FROM categories WHERE type='series'").fetchone()
         self.s.add_page(cat, [{'id': 'tt123', 'name': 'Show'}], 0, 100)
@@ -116,9 +119,27 @@ class IndexTests(unittest.TestCase):
                   for s in (1, 2, 3) for e in (1, 2)]
         self.s.save_meta('series', 'tt123', {'id': 'tt123', 'name': 'Show', 'videos': videos}, NOW)
         priority = {r['id']: r['priority'] for r in self.s.db.execute('SELECT id,priority FROM checks')}
-        self.assertLess(priority['tt123:3:1'], priority['tt123:2:1'])
-        self.assertLess(priority['tt123:2:1'], priority['tt123:1:1'])
-        self.assertLess(priority['tt123:1:1'], priority['tt123:3:2'])
+        self.assertEqual(priority, {'tt123:3:1': 0, 'tt123:1:1': 1})
+
+    def test_new_season_moves_probe_and_parks_old_confirmation(self):
+        self.s.add_categories([{'id': 'upstream.shows', 'type': 'series', 'name': 'Shows'}], 'cachedlibrary')
+        cat = self.s.db.execute("SELECT * FROM categories WHERE type='series'").fetchone()
+        self.s.add_page(cat, [{'id': 'tt123', 'name': 'Show'}], 0, 100)
+        videos = [{'id': 'tt123:%d:1' % s, 'season': s, 'episode': 1, 'released': PAST} for s in (1, 2)]
+        self.s.save_meta('series', 'tt123', {'id': 'tt123', 'name': 'Show', 'videos': videos}, NOW)
+        self.s.record('series', 'tt123:2:1', 'tt123', 'available', 1, NOW)
+        videos.append({'id': 'tt123:3:1', 'season': 3, 'episode': 1, 'released': PAST})
+        self.s.save_meta('series', 'tt123', {'id': 'tt123', 'name': 'Show', 'videos': videos}, NOW + 10)
+        rows = {r['id']: dict(r) for r in self.s.db.execute('SELECT * FROM checks')}
+        self.assertEqual(set(rows), {'tt123:3:1', 'tt123:2:1', 'tt123:1:1'})
+        # The old opener stays a valid confirmation but is never scheduled again.
+        self.assertEqual(rows['tt123:2:1']['status'], 'available')
+        self.assertGreaterEqual(rows['tt123:2:1']['due'], 1e15)
+        self.assertLess(rows['tt123:3:1']['due'], NOW)
+        self.assertIsNotNone(self.s.meta('series', 'tt123', NOW + 11))
+        # Once that confirmation has expired, the next refresh removes it.
+        self.s.save_meta('series', 'tt123', {'id': 'tt123', 'name': 'Show', 'videos': videos}, NOW + 3600)
+        self.assertEqual({r[0] for r in self.s.db.execute('SELECT id FROM checks')}, {'tt123:3:1', 'tt123:1:1'})
 
     def test_aired_respects_timezone_offsets(self):
         base = {'id': 'x:1:1', 'season': 1, 'episode': 1}

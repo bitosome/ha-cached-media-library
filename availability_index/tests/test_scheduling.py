@@ -1,4 +1,4 @@
-"""Scheduling fairness for large episode backlogs and interactive requests."""
+"""Scheduling fairness between movies and series probes, and interactive requests."""
 import os
 import sys
 import tempfile
@@ -38,7 +38,8 @@ class SchedulingTests(unittest.TestCase):
             {'id': 'movie%03d' % i, 'name': 'Movie %d' % i} for i in range(count)
         ], 0, 1000)
 
-    def add_shows(self, count, episodes=12):
+    def add_shows(self, count, episodes=12, seasons=2):
+        # Two seasons give each show two probes: <show>:2:1, then <show>:1:1.
         self.app.store.add_page(self.categories['series'], [
             {'id': 'show%03d' % i, 'name': 'Show %d' % i} for i in range(count)
         ], 0, 1000)
@@ -46,9 +47,9 @@ class SchedulingTests(unittest.TestCase):
             ident = 'show%03d' % i
             self.app.store.save_meta('series', ident, {
                 'id': ident, 'name': ident,
-                'videos': [{'id': ident + ':1:' + str(e), 'season': 1,
+                'videos': [{'id': '%s:%d:%d' % (ident, season, e), 'season': season,
                             'episode': e, 'released': '2000-01-01T00:00:00Z'}
-                           for e in range(1, episodes + 1)],
+                           for season in range(1, seasons + 1) for e in range(1, episodes + 1)],
             }, time.time())
 
     def finish(self, row, verdict='error'):
@@ -57,15 +58,15 @@ class SchedulingTests(unittest.TestCase):
         self.app.inflight.discard((row['type'], row['id'], row['parent']))
 
     def mark_show_verified(self, ident):
-        self.app.store.record('series', ident + ':1:1', ident, 'available', 1, time.time())
+        self.app.store.record('series', ident + ':2:1', ident, 'available', 1, time.time())
         self.app.store.db.execute('UPDATE titles SET scan_touched=? WHERE type=? AND id=?',
                                   (time.time() - 10, 'series', ident))
         self.app.store.db.commit()
 
     def test_movie_turns_do_not_consume_pending_series_batch(self):
         self.add_movies(5)
-        self.add_shows(1)
-        self.mark_show_verified('show000')
+        self.add_shows(4)
+        self.app.prioritize('series', ident='show000')
         picked = []
         for i in range(8):
             preferred = 'series' if i % 2 == 0 else 'movie'
@@ -77,8 +78,7 @@ class SchedulingTests(unittest.TestCase):
 
     def test_worker_requests_alternate_types_despite_series_backlog(self):
         self.add_movies(5)
-        self.add_shows(1, episodes=50)
-        self.mark_show_verified('show000')
+        self.add_shows(5)
         calls = []
         def request(path):
             calls.append(path.split('/')[2])
@@ -90,63 +90,58 @@ class SchedulingTests(unittest.TestCase):
             self.app.worker(0)
         self.assertEqual(calls, ['movie', 'series'] * 4)
 
-    def test_initial_show_coverage_precedes_episode_depth(self):
+    def test_each_show_is_confirmed_by_one_check(self):
         self.add_shows(20, episodes=8)
         picked = []
         for _ in range(20):
             row = self.app.next_check('series')
-            picked.append(row['parent'])
+            picked.append((row['parent'], row['id']))
             self.finish(row, 'available')
-        self.assertEqual(len(set(picked)), 20)
-        self.assertEqual(picked[0], 'show000')
-        self.assertEqual(picked[-1], 'show019')
-        # After the initial breadth pass, a verified show's next three episodes
-        # form a batch and are not permanently omitted by the episode quantum.
-        deeper = []
-        for _ in range(3):
-            row = self.app.next_check('series')
-            deeper.append(row['parent'])
-            self.finish(row, 'available')
-        self.assertEqual(deeper, ['show000'] * 3)
+        self.assertEqual(picked, [('show%03d' % i, 'show%03d:2:1' % i) for i in range(20)])
+        # Confirmed shows need nothing more until their renewal.
+        self.assertIsNone(self.app.next_check('series'))
 
     def test_unverified_shows_continue_one_episode_per_rotation(self):
         self.add_shows(3)
         picked = []
         for _ in range(6):
             row = self.app.next_check('series')
-            picked.append(row['parent'])
+            picked.append(row['id'])
             self.finish(row)
-        self.assertEqual(picked, ['show000', 'show001', 'show002'] * 2)
+        # Newest-season openers in turn, then the first-season fallbacks.
+        self.assertEqual(picked, ['show000:2:1', 'show001:2:1', 'show002:2:1',
+                                  'show000:1:1', 'show001:1:1', 'show002:1:1'])
+        self.assertIsNone(self.app.next_check('series'))
 
     def test_requested_show_gets_batch_without_stealing_movie_turn(self):
         self.add_movies(2)
         self.add_shows(3)
         self.app.prioritize('series', ident='show002')
         picked = []
-        for _ in range(3):
+        for _ in range(2):
             row = self.app.next_check('series')
-            picked.append(row['parent'])
+            picked.append(row['id'])
             self.finish(row)
             if len(picked) == 1:
                 movie = self.app.next_check('movie')
                 self.assertEqual(movie['type'], 'movie')
                 self.finish(movie)
-        self.assertEqual(picked, ['show002'] * 3)
+        self.assertEqual(picked, ['show002:2:1', 'show002:1:1'])
 
     def test_urgent_positive_renewal_precedes_type_fairness(self):
         self.add_movies(1)
         self.add_shows(1)
-        self.app.store.record('series', 'show000:1:12', 'show000',
+        self.app.store.record('series', 'show000:2:1', 'show000',
                               'available', 1, time.time() - 40000)
         row = self.app.next_check('movie')
-        self.assertEqual((row['type'], row['id']), ('series', 'show000:1:12'))
+        self.assertEqual((row['type'], row['id']), ('series', 'show000:2:1'))
 
     def test_expired_error_positives_share_normal_type_budget(self):
         self.add_movies(2)
-        self.add_shows(1, episodes=2)
+        self.add_shows(1, episodes=1)
         now = time.time()
-        for episode in (1, 2):
-            ident = 'show000:1:' + str(episode)
+        for season in (1, 2):
+            ident = 'show000:%d:1' % season
             self.app.store.record('series', ident, 'show000', 'available', 1, now - 50000)
             self.app.store.record('series', ident, 'show000', 'error', 0, now - 1000)
         stored = self.app.store.db.execute("SELECT status,expires,failures FROM checks WHERE type='series'").fetchall()
@@ -180,7 +175,7 @@ class SchedulingTests(unittest.TestCase):
     def test_queued_checks_from_inactive_shelf_are_not_returned(self):
         self.add_movies(1)
         self.add_shows(1)
-        self.mark_show_verified('show000')
+        self.app.prioritize('series', ident='show000')
         first = self.app.next_check('series')
         self.finish(first)
         self.assertTrue(self.app.check_queue['series'])

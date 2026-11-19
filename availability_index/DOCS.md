@@ -1,7 +1,7 @@
 # Cached Media Library
 
-Publishes discovery shelves, search results and series episodes with recently
-confirmed cached streams under your AIOStreams playback profile's filters. It
+Publishes discovery shelves and search results with recently confirmed cached
+streams under your AIOStreams playback profile's filters. It
 never proxies video, stores stream URLs, or writes AIOStreams configuration.
 
 A confirmation is a recent observation, not a playback guarantee. A provider may
@@ -66,7 +66,7 @@ URLs as credentials; avoid pasting them into public logs or issue reports.
 | `max_candidates_per_category` | Upstream candidate depth per shelf, 20–5000; default 250. It is not a target number of verified results. |
 | `catalog_refresh_hours` | Refresh interval for completed source catalogues, 1–48 hours; default 6. Availability workers run continuously regardless of this interval. |
 | `catalog_revision` | Optional manual marker, empty by default. Change it after saving source selection filters to request one fresh crawl of every active shelf. Unchanged values do not restart crawling. |
-| `max_episodes_per_series` | Progressive episode batch size, 1–100; default 12. All aired candidates remain eligible; this does not permanently cap visible episodes. |
+| `max_episodes_per_series` | Checks per requested show per visit, 1–100; default 12. Since 0.11.0 a series has at most two checks, so values above 2 have no further effect. |
 | `workers` | Concurrent availability workers, 1–6; default 2. They share the rate budget below. |
 | `metadata_workers` | Concurrent metadata fetches, 1–6; default 3. Long series can have large episode lists. |
 | `stream_requests_per_minute` | Shared stream-check request budget across all workers, 1–600; default 30. Leave headroom for playback and other clients under AIOStreams' own limit. |
@@ -135,7 +135,7 @@ Local catalogue definitions are not required for this; the credential is enough.
 Titles are addressed by their indexed IMDb (`tt…`) or `tmdb:<id>` identity.
 Episodes keep the `<series id>:<season>:<episode>` identity the stream checks
 use, following TMDB's season and episode numbering. If TMDB's episode list
-numbers a show differently from its existing checks (no shared episode, or more
+numbers a show differently from its stored episode list (no shared episode, or more
 than 10% of its regular episodes missing), the list is refused and counted as
 `metadata.identity_conflicts` in `/status` (titles are named in
 `identity_conflict_titles`), so confirmations are never silently discarded.
@@ -332,18 +332,21 @@ saved playback profile until effective-policy resolution is supported.
 ## Availability, retries and pacing
 
 Movie and series work use separate queues and alternate when both have work.
-Unverified shows receive one probe per rotation to spread coverage across titles;
-verified or explicitly requested shows can use the configured episode batch.
+A series has at most two checks (0.11.0): its newest aired season's first
+episode, and its first season's first episode as a fallback that is deferred
+until shortly after the newest opener's renewal whenever that opener is
+confirmed. Unverified shows receive one probe per rotation to spread coverage
+across titles; explicitly requested shows can use both probes at once.
 One in four dispatch opportunities can prioritise an explicitly searched or
 opened title ahead of renewals, while respecting provider retry deadlines.
 Otherwise still-valid confirmations due for renewal take priority over expanding the
 unchecked backlog. Expired confirmations rejoin ordinary scheduling. A large
-complete-episode index can still take days to cover within provider limits.
+first full pass is about one check per movie and one or two per series.
 
 
 - A movie needs a playable stream surviving the playback profile's filters. A
-  series needs at least one confirmed aired episode; its published metadata
-  contains only its confirmed episodes.
+  series needs one confirmed probe episode; its published metadata lists every
+  aired episode, and the playback profile decides on each one when played.
 - A successful confirmation expires after `positive_hours`, with a refresh
   scheduled before expiry. Failed refreshes do not extend the confirmation.
 - An explicit negative result is retained for `negative_hours` (24 by default).

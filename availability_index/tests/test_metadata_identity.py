@@ -48,7 +48,7 @@ class MetadataIdentityTests(unittest.TestCase):
         self.assertEqual(meta['id'], hit['id'])
         self.assertEqual(meta['tmdb_id'], '82728')
         self.assertEqual(meta['imdb_id'], 'tt7678620')
-        self.assertEqual([v['id'] for v in meta['videos']], ['tt7678620:1:1', 'tt7678620:2:1'])
+        self.assertEqual([v['id'] for v in meta['videos']], ['tt7678620:1:1', 'tt7678620:1:2', 'tt7678620:2:1'])
         self.assertEqual({v['season'] for v in meta['videos']}, {1, 2})
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(json.loads(self.store.db.execute("SELECT meta FROM titles WHERE id='tt7678620'").fetchone()[0]), original)
@@ -62,7 +62,7 @@ class MetadataIdentityTests(unittest.TestCase):
         meta = self.store.meta('series', 'tmdb:82728', self.now)
         self.assertEqual(meta['id'], 'tmdb:82728')
         self.assertEqual(meta['imdb_id'], 'tt7678620')
-        self.assertEqual([v['id'] for v in meta['videos']], ['tt7678620:1:1', 'tt7678620:2:1'])
+        self.assertEqual([v['id'] for v in meta['videos']], ['tt7678620:1:1', 'tt7678620:1:2', 'tt7678620:2:1'])
         self.assertEqual(self.snapshot(), before)
 
     def test_explicit_provider_identity_fields_are_never_overwritten(self):

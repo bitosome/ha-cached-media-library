@@ -51,7 +51,7 @@ class AppIntegrationReviewTests(unittest.TestCase):
         self.app.request = request
         self.app.metadata_worker(0)
         self.assertEqual(calls, [('/meta/series/tt1.json', {'catalog': True})])
-        self.assertEqual(self.app.store.db.execute('SELECT count(*) FROM checks').fetchone()[0], 3)
+        self.assertEqual(self.app.store.db.execute('SELECT count(*) FROM checks').fetchone()[0], 1)  # The season opener probe
 
     def test_failed_worker_releases_claim_and_preserves_positive(self):
         self.add_title('movie')

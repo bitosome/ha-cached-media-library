@@ -35,19 +35,18 @@ class StoreRegressionTests(unittest.TestCase):
         return [{'id': '%s:1:%d' % (ident, number), 'season': 1, 'episode': number,
                  'released': '2020-01-01T00:00:00Z'} for number in range(1, count + 1)]
 
-    def test_all_episodes_persist_and_newest_first_priority_survives_refresh(self):
+    def test_only_probes_are_checked_and_every_episode_is_listed(self):
         self.add('series', {'id': 'tt1', 'name': 'Show'})
         videos = self.videos()
         videos.append({'id': 'tt1:0:1', 'season': 0, 'episode': 1, 'released': '2020-01-01T00:00:00Z'})
         self.store.save_meta('series', 'tt1', {'id': 'tt1', 'videos': videos[::-1]}, self.now)
-        rows = self.store.db.execute('SELECT id FROM checks ORDER BY priority').fetchall()
-        # Newest season openers probe first, specials after the regular openers.
-        self.assertEqual([r[0] for r in rows],
-                         ['tt1:1:1', 'tt1:0:1'] + ['tt1:1:%d' % n for n in range(2, 9)])
-        self.store.record('series', 'tt1:1:8', 'tt1', 'available', 1, self.now)
+        # One regular season: its opener is the only probe; specials are not probed.
+        self.assertEqual([r[0] for r in self.store.db.execute('SELECT id FROM checks')], ['tt1:1:1'])
+        self.store.record('series', 'tt1:1:1', 'tt1', 'available', 1, self.now)
         self.store.save_meta('series', 'tt1', {'id': 'tt1', 'videos': videos}, self.now + 10)
-        self.assertEqual(self.store.db.execute('SELECT count(*) FROM checks').fetchone()[0], 9)
-        self.assertEqual([v['id'] for v in self.store.meta('series', 'tt1', self.now + 11)['videos']], ['tt1:1:8'])
+        self.assertEqual(self.store.db.execute("SELECT status FROM checks").fetchall()[0][0], 'available')
+        listed = [v['id'] for v in self.store.meta('series', 'tt1', self.now + 11)['videos']]
+        self.assertEqual(sorted(listed), sorted(v['id'] for v in videos))
 
     def test_bad_metadata_preserves_prior_metadata_and_checks(self):
         self.add('series', {'id': 'tt1', 'name': 'Show'})
@@ -60,16 +59,19 @@ class StoreRegressionTests(unittest.TestCase):
             row = self.store.db.execute("SELECT meta,meta_due FROM titles WHERE id='tt1'").fetchone()
             self.assertEqual(json.loads(row['meta']), original)
             self.assertEqual(row['meta_due'], self.now + 1820)
-            self.assertEqual(self.store.db.execute('SELECT count(*) FROM checks').fetchone()[0], 8)
+            self.assertEqual(self.store.db.execute('SELECT count(*) FROM checks').fetchone()[0], 1)
+            self.assertTrue(self.store.visible('series', 'tt1', self.now + 21))
 
     def test_episode_cleanup_is_parent_scoped(self):
         self.add('series', {'id': 'tt1', 'name': 'Show'}, {'id': 'tmdb:1', 'name': 'Alias'})
+        two_seasons = self.videos(count=2) + [{'id': 'tt1:2:1', 'season': 2, 'episode': 1,
+                                               'released': '2020-01-01T00:00:00Z'}]
         for ident in ('tt1', 'tmdb:1'):
-            self.store.save_meta('series', ident, {'id': 'tt1', 'videos': self.videos(count=2)}, self.now)
-        self.store.record('series', 'tt1:1:2', 'tmdb:1', 'available', 1, self.now)
+            self.store.save_meta('series', ident, {'id': 'tt1', 'videos': two_seasons}, self.now)
         self.store.save_meta('series', 'tt1', {'id': 'tt1', 'videos': self.videos(count=1)}, self.now + 1)
-        self.assertEqual(self.store.db.execute("SELECT count(*) FROM checks WHERE parent='tt1'").fetchone()[0], 1)
-        self.assertTrue(self.store.visible('series', 'tmdb:1', self.now + 2))
+        self.assertEqual({r[0] for r in self.store.db.execute("SELECT id FROM checks WHERE parent='tt1'")}, {'tt1:1:1'})
+        self.assertEqual({r[0] for r in self.store.db.execute("SELECT id FROM checks WHERE parent='tmdb:1'")},
+                         {'tt1:1:1', 'tt1:2:1'})
 
     def test_russian_and_original_aliases_survive_catalog_and_metadata_refresh(self):
         preview = {'id': 'tt2', 'name': 'The Bear'}
@@ -125,7 +127,7 @@ class StoreRegressionTests(unittest.TestCase):
         for field in ('videos', 'streams', 'behaviorHints'):
             self.assertNotIn(field, preview)
         self.assertEqual([tuple(row) for row in self.store.db.execute('SELECT * FROM checks ORDER BY id')], proofs)
-        self.assertEqual([v['id'] for v in self.store.meta('series', 'tmdb:1', self.now + 1)['videos']], ['tt1:1:1'])
+        self.assertEqual([v['id'] for v in self.store.meta('series', 'tmdb:1', self.now + 1)['videos']], ['tt1:1:1', 'tt1:1:2'])
         self.assertEqual(self.store.catalog('series', self.category('series')['id'], now=self.now + 3601), [])
 
     def test_tmdb_score_is_never_substituted_for_absent_imdb_score(self):

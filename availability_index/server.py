@@ -47,7 +47,7 @@ NON_POLICY_KEYS = frozenset({
     'usePosterServiceForMeta',
 })
 STRICT_FILTER = "cached(service(streams, 'torbox'))"
-APP_VERSION = '0.10.2'  # Keep in sync with config.yaml; clients read it for caching.
+APP_VERSION = '0.11.0'  # Keep in sync with config.yaml; clients read it for caching.
 
 
 def encode(value):
@@ -156,9 +156,28 @@ def aired(video, now):
         return False
 
 
-def episode_order(video):
-    """Probe the newest seasons first, and each season's opener before its filler."""
-    return (0 if video['episode'] == 1 else 1, -video['season'], video['episode'])
+# A parked check keeps a still-valid confirmation visible until it expires, but
+# is never scheduled again (see Store._reconcile_series_checks).
+PARKED_DUE = 1e15
+
+
+def series_probes(videos):
+    """The episodes that decide whether a series is shown, in probe order.
+
+    Availability is decided per title, not per episode: the newest aired
+    season's first episode, then the first season's first episode as a
+    fallback. Debrid caches hold whole torrents, usually season packs, so one
+    cached opener stands for its season; the details page lists every aired
+    episode and the playback profile decides on each one when it is played.
+    Specials are probed only when a show has nothing else."""
+    regular = [v for v in videos if v['season'] > 0]
+    pool = regular or videos
+    if not pool:
+        return []
+    def opener(season):
+        return min((v for v in pool if v['season'] == season), key=lambda v: (v['episode'], v['id']))['id']
+    seasons = {v['season'] for v in pool}
+    return list(dict.fromkeys((opener(max(seasons)), opener(min(seasons)))))
 
 
 def policy_fingerprint(config):
@@ -426,6 +445,9 @@ class Store:
 
     def invalidate(self):
         with self.lock:
+            # A parked row only kept an old confirmation visible; with the
+            # confirmations gone it must not become a pending check again.
+            self.db.execute('DELETE FROM checks WHERE due>=?', (PARKED_DUE,))
             self.db.execute("UPDATE checks SET status='pending',expires=0,due=0,attempted=0")
             self.db.commit()
 
@@ -709,7 +731,9 @@ class Store:
                                     key=lambda v: (v['season'] == 0, v['season'], v['episode'], v['id']))
                     valid = bool(videos)
                 if valid and keep_identity:
-                    existing = {r['id'] for r in self.db.execute(
+                    # Compare with the episode list SenPlayer currently shows. Only a
+                    # show's probe episodes have checks, too few to judge numbering.
+                    existing = self._stored_episode_ids(title, now) or {r['id'] for r in self.db.execute(
                         'SELECT id FROM checks WHERE type=? AND parent=?', (kind, ident)).fetchall()}
                     if renumbered(existing, {v['id'] for v in videos}):
                         self.identity_conflicts.add((kind, ident))
@@ -732,26 +756,79 @@ class Store:
             self.db.execute('UPDATE titles SET meta=?,meta_due=?,meta_checked=?,meta_claimed=0,search=? WHERE type=? AND id=?',
                             (encode(meta), now + 86400, now, search, kind, ident))
             if kind == 'series':
-                # max_episodes controls the worker's batch size, never completeness
-                # of the persistent candidate list. Probe the newest seasons first
-                # (openers before filler), specials after the regular seasons.
-                probe = {v['id']: position for position, v in
-                         enumerate(sorted(videos, key=episode_order))}
-                for video in videos:
-                    self.db.execute('''INSERT INTO checks(type,id,parent,priority) VALUES (?,?,?,?)
-                      ON CONFLICT(type,id,parent) DO UPDATE SET priority=excluded.priority''',
-                                    (kind, video['id'], ident, probe[video['id']]))
-                keep = {v['id'] for v in videos}
-                for row in self.db.execute('SELECT id FROM checks WHERE type=? AND parent=?', (kind, ident)).fetchall():
-                    if row['id'] not in keep:
-                        self.db.execute('DELETE FROM checks WHERE type=? AND id=? AND parent=?', (kind, row['id'], ident))
-                if self.setting('policy'):
-                    try:
-                        self._share_alias_checks(keep, now)
-                    except Exception:
-                        self.db.rollback()
-                        raise
+                try:
+                    self._reconcile_series_checks(ident, videos, now)
+                except Exception:
+                    self.db.rollback()
+                    raise
             self.db.commit()
+
+    @staticmethod
+    def _stored_episode_ids(title, now):
+        """Aired episode ids of a title's stored metadata (empty if none)."""
+        try:
+            stored = json.loads(title['meta'] or '{}')
+        except ValueError:
+            return set()
+        if not isinstance(stored, dict) or error_meta(stored) or not isinstance(stored.get('videos'), list):
+            return set()
+        return {v['id'] for v in stored['videos'] if isinstance(v, dict) and isinstance(v.get('id'), str) and aired(v, now)}
+
+    def _reconcile_series_checks(self, ident, videos, now):
+        """Keep only a series' probe checks; caller holds lock and transaction.
+
+        A confirmation of any other episode stays visible until it expires
+        ("parked": never scheduled again) and is removed afterwards. Nothing is
+        copied between episodes, so no confirmation is manufactured."""
+        probes = series_probes(videos)
+        for position, episode in enumerate(probes):
+            self.db.execute('''INSERT INTO checks(type,id,parent,priority) VALUES ('series',?,?,?)
+              ON CONFLICT(type,id,parent) DO UPDATE SET priority=excluded.priority,
+              due=CASE WHEN checks.due>=? THEN 0 ELSE checks.due END''', (episode, ident, position, PARKED_DUE))
+        keep = set(probes)
+        for row in self.db.execute("SELECT id,status,expires FROM checks WHERE type='series' AND parent=?",
+                                   (ident,)).fetchall():
+            if row['id'] in keep:
+                continue
+            if row['status'] == 'available' and row['expires'] > now + 60:
+                self.db.execute("UPDATE checks SET due=? WHERE type='series' AND id=? AND parent=?",
+                                (PARKED_DUE, row['id'], ident))
+            else:
+                self.db.execute("DELETE FROM checks WHERE type='series' AND id=? AND parent=?", (row['id'], ident))
+        if self.setting('policy'):
+            self._share_alias_checks(keep, now)
+
+    def adopt_title_level_checks(self, marker='title_level_checks_v1', now=None):
+        """One-time move from per-episode checks to per-title probes, using the
+        stored episode lists (no network). Shows without stored metadata are
+        reconciled when their metadata is next fetched."""
+        now = time.time() if now is None else now
+        with self.lock:
+            if self.setting(marker) is not None:
+                return None
+            before = self.db.execute("SELECT count(*) FROM checks WHERE type='series'").fetchone()[0]
+            shows = 0
+            try:
+                for title in self.db.execute("SELECT id,meta FROM titles WHERE type='series' AND meta IS NOT NULL").fetchall():
+                    try:
+                        stored = json.loads(title['meta'])
+                    except ValueError:
+                        continue
+                    if not isinstance(stored, dict) or error_meta(stored) or not isinstance(stored.get('videos'), list):
+                        continue
+                    videos = [v for v in stored['videos'] if isinstance(v, dict) and isinstance(v.get('id'), str)
+                              and isinstance(v.get('released'), str) and aired(v, now)]
+                    if videos:
+                        self._reconcile_series_checks(title['id'], videos, now)
+                        shows += 1
+                after = self.db.execute("SELECT count(*) FROM checks WHERE type='series'").fetchone()[0]
+                result = {'shows': shows, 'series_checks_before': before, 'series_checks_after': after}
+                self.db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', (marker, encode(dict(result, at=now))))
+                self.db.commit()
+                return result
+            except Exception:
+                self.db.rollback()
+                raise
 
     def tmdb_hint(self, kind, ident):
         """A TMDB id already recorded for this title, or None. Only a hint: the
@@ -925,6 +1002,12 @@ class Store:
                 ttl = self.positive if verdict == 'available' else self.negative
                 self.db.execute('''UPDATE checks SET status=?,checked=?,expires=?,due=?,attempted=?,failures=0,count=?
                   WHERE type=? AND id=? AND parent=?''', (verdict, now, now + ttl, now + ttl * .8, now, count, kind, ident, parent))
+                if kind == 'series' and verdict == 'available':
+                    # One confirmed probe shows the series; its fallback probe waits
+                    # until shortly after this one's renewal, and runs then only if
+                    # the renewal has not confirmed the series again.
+                    self.db.execute('''UPDATE checks SET due=MAX(due,?) WHERE type='series' AND parent=? AND id!=?
+                      AND NOT (status='available' AND expires>?)''', (now + ttl * .8 + 600, parent, ident, now + 60))
                 if kind == 'series' and self.setting('policy'):
                     try:
                         self._share_alias_checks([ident], now)
@@ -1107,8 +1190,9 @@ class Store:
                         meta['imdb_id'] = original
             meta['id'] = ident
             if kind == 'series':
-                allowed = {r[0] for r in self.db.execute("SELECT id FROM checks WHERE type=? AND parent=? AND status='available' AND expires>?", (kind, ident, now + 60))}
-                meta['videos'] = [v for v in meta.get('videos', []) if v.get('id') in allowed and aired(v, now)]
+                # The series is confirmed (visible above); every aired episode is
+                # listed and the playback profile decides on each when it is played.
+                meta['videos'] = [v for v in meta.get('videos') or [] if isinstance(v, dict) and aired(v, now)]
             return meta
 
     def lookup(self, kind, ident):
@@ -1198,6 +1282,10 @@ class App:
             cleared = self.store.refresh_all_metadata('native_metadata_v1')
             if cleared:
                 print('Discarded ' + str(cleared) + ' provider error cards stored as metadata', flush=True)
+        adopted = self.store.adopt_title_level_checks()
+        if adopted and adopted['series_checks_before']:
+            print('Title-level verification: %(shows)d shows now keep %(series_checks_after)d of '
+                  '%(series_checks_before)d episode checks' % adopted, flush=True)
         self.metadata_errors = 0
         self.ready = False
         self.error = 'Initialising'
@@ -1804,6 +1892,7 @@ class Handler(BaseHTTPRequestHandler):
                                    # their existing checks; their stored episodes are kept.
                                    'identity_conflict_titles': sorted(
                                        k + ':' + i for k, i in list(app.store.identity_conflicts))[:50]},
+                      'verification': {'series': 'title-probes', 'migration': app.store.setting('title_level_checks_v1')},
                       'worker_errors': app.worker_errors,
                       'workers_alive': {k: v.is_alive() for k,v in app.threads.items()},
                       'worker_ages': {k: round(time.time() - v) for k, v in app.heartbeats.items()}, **app.store.status()}

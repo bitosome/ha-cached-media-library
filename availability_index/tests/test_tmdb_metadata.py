@@ -219,7 +219,7 @@ class NativeMetadataStoreTests(unittest.TestCase):
         grown = {'id': 'tt7678620', 'name': 'Bluey', 'videos': self.videos('tt7678620', 7)}
         self.store.save_meta('series', 'tt7678620', grown, self.now + 6, keep_identity=True)
         self.assertEqual(self.store.identity_conflicts, set())  # Resolved once a list matches.
-        self.assertEqual(self.store.db.execute('SELECT count(*) FROM checks').fetchone()[0], 7)
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM checks').fetchone()[0], 1)  # One season: one probe
         self.assertEqual(self.store.db.execute(
             "SELECT status FROM checks WHERE id='tt7678620:1:1'").fetchone()[0], 'available')
 
@@ -271,7 +271,7 @@ class NativeMetadataAppTests(unittest.TestCase):
         self.app.tmdb_meta._fetch = transport
         self.app.fetch_meta('series', 'tt7678620')
         ids = [r['id'] for r in self.app.store.db.execute('SELECT id FROM checks ORDER BY priority')]
-        self.assertEqual(ids, ['tt7678620:1:1', 'tt7678620:0:1', 'tt7678620:1:2'])
+        self.assertEqual(ids, ['tt7678620:1:1'])  # Season 1's opener; specials are not probed
         self.assertEqual(self.app.store.get_tmdb_identity('series', 82728, time.time())['imdb_id'], 'tt7678620')
 
     def test_tmdb_failure_keeps_stored_metadata_and_retries(self):

@@ -62,11 +62,11 @@ configuration:
       How deep each catalogue is indexed. Larger values give broader coverage
       and take longer to complete. Search only covers what is indexed.
   max_episodes_per_series:
-    name: Progressive episode batch size
+    name: Series check batch size
     description: >-
-      Checks scheduled per show before moving on. All aired candidates remain
-      eligible; this is not a permanent episode limit. Only confirmed episodes
-      are exposed.
+      Checks scheduled per requested show before moving on. Since 0.11.0 a
+      series has at most two checks (season openers), so values above 2 have
+      no further effect. Every aired episode of a confirmed series is listed.
   catalog_refresh_hours:
     name: Catalogue refresh interval (hours)
     description: >-

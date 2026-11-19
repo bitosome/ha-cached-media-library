@@ -34,9 +34,10 @@ class AppIntegrationTests(unittest.TestCase):
         self.app.store.db.close()
         self.temp.cleanup()
 
-    def save(self,ident='tt1',count=5):
+    def save(self,ident='tt1',count=5,seasons=2):
         self.app.store.save_meta('series',ident,{'id':ident,'name':ident,'genres':['Animation','Family'],
-            'videos':[{'id':ident+':1:'+str(i),'season':1,'episode':i,'released':PAST} for i in range(1,count+1)]},time.time())
+            'videos':[{'id':'%s:%d:%d'%(ident,s,i),'season':s,'episode':i,'released':PAST}
+                      for s in range(1,seasons+1) for i in range(1,count+1)]},time.time())
 
     def test_metadata_always_uses_original_profile(self):
         calls=[]
@@ -48,27 +49,37 @@ class AppIntegrationTests(unittest.TestCase):
         self.app.metadata_worker(0)
         self.assertEqual(calls,[('/meta/series/tt1.json',{'catalog':True})])
 
-    def test_batches_expand_past_old_episode_cap_and_rotate_shows(self):
-        self.save('tt1'); self.save('tt2')
+    def run_checks(self,verdicts):
         picked=[]
-        for _ in range(10):
+        for verdict in verdicts:
             row=self.app.next_check('series')
-            self.assertIsNotNone(row)
+            if row is None:
+                break
             picked.append((row['parent'],row['id']))
-            self.app.store.record(row['type'],row['id'],row['parent'],'available',1,time.time())
+            self.app.store.record(row['type'],row['id'],row['parent'],verdict,int(verdict=='available'),time.time())
             self.app.inflight.discard((row['type'],row['id'],row['parent']))
-        # Probe each previously unverified show once before expanding the now
-        # verified first show in a two-episode batch.
-        self.assertEqual([p for p,_ in picked[:4]],['tt1','tt2','tt1','tt1'])
-        self.assertEqual(len(set(picked)),10)
-        self.assertIn(('tt1','tt1:1:5'),picked)
+        return picked
+
+    def test_confirmed_series_costs_one_check(self):
+        self.save('tt1'); self.save('tt2')
+        # Newest season's opener of each show; a confirmed show never spends its
+        # fallback probe and no other episode of it is ever checked.
+        self.assertEqual(self.run_checks(['available']*10),[('tt1','tt1:2:1'),('tt2','tt2:2:1')])
+        self.assertEqual(self.app.store.db.execute("SELECT count(*) FROM checks").fetchone()[0],4)
+        meta=self.app.store.meta('series','tt1')
+        self.assertEqual(len(meta['videos']),10)
+
+    def test_fallback_probe_runs_when_newest_season_is_not_confirmed(self):
+        self.save('tt1')
+        self.assertEqual(self.run_checks(['error','available']),[('tt1','tt1:2:1'),('tt1','tt1:1:1')])
+        self.assertIsNotNone(self.app.store.meta('series','tt1'))
         self.assertIsNone(self.app.next_check('series'))
 
     def test_expiring_confirmation_precedes_new_backlog(self):
         self.save()
-        self.app.store.record('series','tt1:1:5','tt1','available',1,time.time()-40000)
+        self.app.store.record('series','tt1:1:1','tt1','available',1,time.time()-40000)
         row=self.app.next_check('series')
-        self.assertEqual(row['id'],'tt1:1:5')
+        self.assertEqual(row['id'],'tt1:1:1')
 
     def test_separate_catalogue_and_matching_stream_policy_required(self):
         self.assertEqual(self.app.config_problems(),[])
@@ -93,9 +104,9 @@ class AppIntegrationTests(unittest.TestCase):
             self.app.pace_stream()
             self.assertAlmostEqual(clock[0],147.0)
 
-    def test_http_only_publishes_confirmed_episodes_and_genres(self):
+    def test_http_publishes_confirmed_series_with_every_aired_episode(self):
         self.save()
-        self.app.store.record('series','tt1:1:2','tt1','available',1,time.time())
+        self.app.store.record('series','tt1:1:1','tt1','available',1,time.time())
         server=ThreadingHTTPServer(('127.0.0.1',0),Handler)
         server.app=self.app
         thread=threading.Thread(target=server.serve_forever,daemon=True)
@@ -106,7 +117,8 @@ class AppIntegrationTests(unittest.TestCase):
             genre=next(e for e in manifest['catalogs'][0]['extra'] if e['name']=='genre')
             self.assertEqual(genre['options'],['Animation','Family'])
             with urlopen(root+'/meta/series/tt1.json') as f:meta=json.load(f)['meta']
-            self.assertEqual([v['id'] for v in meta['videos']],['tt1:1:2'])
+            self.assertEqual(len(meta['videos']),10)
+            self.assertIn('tt1:2:5',[v['id'] for v in meta['videos']])
             with urlopen(root+'/catalog/series/cached-search/search=tt1.json') as f:items=json.load(f)['metas']
             self.assertEqual(len(items),1)
             self.app.store.invalidate()

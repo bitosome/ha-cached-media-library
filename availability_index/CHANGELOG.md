@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.11.0
+
+- Series are confirmed per title instead of per episode. Each show has at most
+  two checks: its newest aired season's first episode, then its first season's
+  first episode as a fallback that only runs while the newest one is not
+  confirmed. A confirmed series lists every aired episode; the playback
+  profile decides on each one when it is played. Debrid caches hold whole
+  torrents, usually season packs, so one cached opener stands for its season.
+  This replaces about 96% of all checks: a full pass is now roughly one check
+  per movie and one or two per series, so shelves fill in hours instead of
+  days after a profile change, and providers see far fewer requests.
+- One-time migration at start, from the stored episode lists (no network):
+  each show keeps only its probe checks. A confirmation of any other episode
+  stays visible until it expires and is never rechecked; nothing is copied
+  between episodes. `/status` reports the result under `verification`.
+- The numbering guard for TMDB episode lists compares with the stored episode
+  list instead of the existing checks, so held-back shows stay protected.
+- Possible after this change: an episode of a listed show without a cached
+  file (outside a cached season pack). The playback profile then offers no
+  stream for that episode.
+
 ## 0.10.2
 
 - Probe a series' newest seasons first: episode check priorities now follow the

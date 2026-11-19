@@ -113,15 +113,16 @@ class SearchPoolTests(unittest.TestCase):
         self.store.db.rollback()
         self.assertIsNotNone(self.proof('tt1'))
 
-    def test_series_waits_for_metadata_and_confirmed_aired_episode(self):
+    def test_series_waits_for_metadata_and_a_confirmed_probe(self):
         self.store.add_search_results('series', [{'id': 'tt1', 'name': 'Series'}], self.now)
         self.assertEqual(self.store.search_matches('series', 'series', now=self.now), ['tt1'])
         self.assertEqual(self.store.db.execute("SELECT count(*) FROM checks WHERE type='series'").fetchone()[0], 0)
         self.store.save_meta('series', 'tt1', {'id': 'tt1', 'videos': [
             {'id': 'tt1:1:1', 'season': 1, 'episode': 1, 'released': '2020-01-01'},
             {'id': 'tt1:1:2', 'season': 1, 'episode': 2, 'released': '2020-01-01'}]}, self.now)
+        self.assertIsNone(self.store.meta('series', 'tt1', self.now))
         self.store.record('series', 'tt1:1:1', 'tt1', 'available', 1, self.now)
-        self.assertEqual([v['id'] for v in self.store.meta('series', 'tt1', self.now)['videos']], ['tt1:1:1'])
+        self.assertEqual([v['id'] for v in self.store.meta('series', 'tt1', self.now)['videos']], ['tt1:1:1', 'tt1:1:2'])
 
     def test_relevance_dedup_and_pagination_use_only_fresh_confirmations(self):
         previews = [{'id': 'tt%04d' % i, 'name': 'Puss in Boots %d' % i} for i in range(102)]

@@ -25,8 +25,10 @@ class AliasEvidenceTests(unittest.TestCase):
 
     def meta(self, canonical='tt1', ids=None):
         return {'id': canonical, 'name': 'A', 'videos': [
-            {'id': ident, 'season': 1, 'episode': i + 1, 'released': '1970-01-01T00:00:00Z'}
-            for i, ident in enumerate(ids or ['tt1:1:1', 'tt1:1:2'])]}
+            {'id': ident, 'season': int(ident.split(':')[-2]), 'episode': int(ident.split(':')[-1]),
+             'released': '1970-01-01T00:00:00Z'}
+            # Two seasons: only the season openers are probe checks.
+            for ident in ids or ['tt1:1:1', 'tt1:2:1']]}
 
     def row(self, parent, ident='tt1:1:1'):
         row = self.store.db.execute('SELECT * FROM checks WHERE type=? AND id=? AND parent=?', ('series', ident, parent)).fetchone()
@@ -50,13 +52,13 @@ class AliasEvidenceTests(unittest.TestCase):
 
     def test_existing_split_proofs_repair_the_selected_catalogue_alias_union(self):
         self.seed('tt1', 'tt1:1:1', checked=9800)
-        self.seed('tmdb:1', 'tt1:1:2', checked=9900)
+        self.seed('tmdb:1', 'tt1:2:1', checked=9900)
         repaired = self.store.reconcile_alias_confirmations(self.POLICY, self.NOW)
         self.assertEqual(repaired['shared'], 2)
         shelf = self.store.catalog('series', self.cat['id'], now=self.NOW)
         self.assertEqual(len(shelf), 1)
         selected = self.store.meta('series', shelf[0]['id'], self.NOW)
-        self.assertEqual({v['id'] for v in selected['videos']}, {'tt1:1:1', 'tt1:1:2'})
+        self.assertEqual({v['id'] for v in selected['videos']}, {'tt1:1:1', 'tt1:2:1'})
         self.assertEqual(self.row('tmdb:1')['checked'], 9800)
         self.assertEqual(self.row('tmdb:1')['expires'], 13400)
 
