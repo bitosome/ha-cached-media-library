@@ -47,6 +47,7 @@ NON_POLICY_KEYS = frozenset({
     'usePosterServiceForMeta',
 })
 STRICT_FILTER = "cached(service(streams, 'torbox'))"
+APP_VERSION = '0.10.2'  # Keep in sync with config.yaml; clients read it for caching.
 
 
 def encode(value):
@@ -145,7 +146,12 @@ def aired(video, now):
     if not released:  # Unknown air dates must not expose future episodes.
         return False
     try:
-        return datetime.fromisoformat(released.replace('Z', '+00:00')).replace(tzinfo=timezone.utc).timestamp() <= now
+        dt = datetime.fromisoformat(released.replace('Z', '+00:00'))
+        # Offsets are real time, not decoration: convert aware timestamps, only
+        # naive ones (TMDB's midnight UTC dates) are assumed to be UTC.
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).timestamp() <= now
     except (ValueError, TypeError):
         return False
 
@@ -206,6 +212,7 @@ class Store:
         self.catalog_refresh = catalog_refresh
         self.lock = threading.RLock()
         self.identity_conflicts = set()
+        self._genres_cache = {}
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript('''
@@ -726,12 +733,14 @@ class Store:
                             (encode(meta), now + 86400, now, search, kind, ident))
             if kind == 'series':
                 # max_episodes controls the worker's batch size, never completeness
-                # of the persistent candidate list. Start regular seasons in order;
-                # specials follow the main series.
-                for position, video in enumerate(videos):
+                # of the persistent candidate list. Probe the newest seasons first
+                # (openers before filler), specials after the regular seasons.
+                probe = {v['id']: position for position, v in
+                         enumerate(sorted(videos, key=episode_order))}
+                for video in videos:
                     self.db.execute('''INSERT INTO checks(type,id,parent,priority) VALUES (?,?,?,?)
                       ON CONFLICT(type,id,parent) DO UPDATE SET priority=excluded.priority''',
-                                    (kind, video['id'], ident, position))
+                                    (kind, video['id'], ident, probe[video['id']]))
                 keep = {v['id'] for v in videos}
                 for row in self.db.execute('SELECT id FROM checks WHERE type=? AND parent=?', (kind, ident)).fetchall():
                     if row['id'] not in keep:
@@ -1046,9 +1055,15 @@ class Store:
             return result[max(0, skip):max(0, skip) + 100]
 
     def genres(self, kind, now=None):
-        """Genre facets come from the same currently verified pool as catalogues."""
+        """Genre facets come from the same currently verified pool as catalogues.
+
+        Every verified title's documents are parsed for this, twice per manifest
+        request; the answer may lag verification by a minute, never its truth."""
         now = time.time() if now is None else now
         with self.lock:
+            cached = self._genres_cache.get(kind)
+            if cached is not None and cached[0] > now:
+                return cached[1]
             self.prune_search_results(now)
             rows = self.db.execute('''SELECT t.preview,t.meta FROM titles t WHERE t.type=? AND EXISTS
               (SELECT 1 FROM membership m JOIN categories cat ON cat.id=m.category
@@ -1061,7 +1076,9 @@ class Store:
                     for genre in json.loads(data or '{}').get('genres') or []:
                         if isinstance(genre, str) and genre.strip():
                             values.add(genre)
-            return sorted(values, key=folded)
+            values = sorted(values, key=folded)
+            self._genres_cache[kind] = (now + 60, values)
+            return values
 
     def meta(self, kind, ident, now=None):
         now = time.time() if now is None else now
@@ -1718,7 +1735,7 @@ class App:
         for kind in ('movie', 'series'):
             catalogs.append({'id': 'cached-search', 'type': kind, 'name': 'Available ' + kind + ' search',
                              'extra': [{'name': 'search', 'isRequired': True}, {'name': 'skip', 'isRequired': False}]})
-        return {'id': 'local.cached.media.library', 'version': '0.9.2', 'name': 'Cached Media Library',
+        return {'id': 'local.cached.media.library', 'version': APP_VERSION, 'name': 'Cached Media Library',
                 'description': 'Recently verified cached streams matching your AIOStreams filters. Metadata only.',
                 'types': ['movie', 'series'],
                 'resources': ['catalog', {'name': 'meta', 'types': ['movie', 'series'], 'idPrefixes': ['tt', 'tmdb:']}],

@@ -271,7 +271,7 @@ class NativeMetadataAppTests(unittest.TestCase):
         self.app.tmdb_meta._fetch = transport
         self.app.fetch_meta('series', 'tt7678620')
         ids = [r['id'] for r in self.app.store.db.execute('SELECT id FROM checks ORDER BY priority')]
-        self.assertEqual(ids, ['tt7678620:1:1', 'tt7678620:1:2', 'tt7678620:0:1'])
+        self.assertEqual(ids, ['tt7678620:1:1', 'tt7678620:0:1', 'tt7678620:1:2'])
         self.assertEqual(self.app.store.get_tmdb_identity('series', 82728, time.time())['imdb_id'], 'tt7678620')
 
     def test_tmdb_failure_keeps_stored_metadata_and_retries(self):

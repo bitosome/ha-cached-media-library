@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.10.2
+
+- Probe a series' newest seasons first: episode check priorities now follow the
+  newest-seasons-first order (season openers before filler, specials after the
+  regular openers) instead of strict chronological order. Long shows no longer
+  make their newest episodes wait behind the whole back catalogue; existing
+  shows adopt the new order at their daily metadata refresh.
+- Manifest requests are cheaper: genre facets are memoised for a minute instead
+  of re-parsing every verified title's documents on every poll.
+- The published manifest version now tracks the app version (it was stuck at 0.9.2).
+- Air-date checks convert timezone offsets instead of discarding them. Dates
+  from TMDB are unaffected (they are always UTC); only offset-aware timestamps
+  from other metadata sources were shifted before.
+
 ## 0.10.1
 
 - Refuse a TMDB episode list that numbers a show differently from its existing

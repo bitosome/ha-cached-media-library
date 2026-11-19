@@ -35,13 +35,15 @@ class StoreRegressionTests(unittest.TestCase):
         return [{'id': '%s:1:%d' % (ident, number), 'season': 1, 'episode': number,
                  'released': '2020-01-01T00:00:00Z'} for number in range(1, count + 1)]
 
-    def test_all_episodes_persist_and_chronological_priority_survives_refresh(self):
+    def test_all_episodes_persist_and_newest_first_priority_survives_refresh(self):
         self.add('series', {'id': 'tt1', 'name': 'Show'})
         videos = self.videos()
         videos.append({'id': 'tt1:0:1', 'season': 0, 'episode': 1, 'released': '2020-01-01T00:00:00Z'})
         self.store.save_meta('series', 'tt1', {'id': 'tt1', 'videos': videos[::-1]}, self.now)
         rows = self.store.db.execute('SELECT id FROM checks ORDER BY priority').fetchall()
-        self.assertEqual([r[0] for r in rows], [v['id'] for v in videos])
+        # Newest season openers probe first, specials after the regular openers.
+        self.assertEqual([r[0] for r in rows],
+                         ['tt1:1:1', 'tt1:0:1'] + ['tt1:1:%d' % n for n in range(2, 9)])
         self.store.record('series', 'tt1:1:8', 'tt1', 'available', 1, self.now)
         self.store.save_meta('series', 'tt1', {'id': 'tt1', 'videos': videos}, self.now + 10)
         self.assertEqual(self.store.db.execute('SELECT count(*) FROM checks').fetchone()[0], 9)

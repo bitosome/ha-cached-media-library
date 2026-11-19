@@ -1,4 +1,5 @@
 import os
+import json
 import sqlite3
 import sys
 import tempfile
@@ -106,6 +107,36 @@ class IndexTests(unittest.TestCase):
     def test_episode_order_prefers_newest_season_openers(self):
         videos = [{'season': 1, 'episode': 5}, {'season': 2, 'episode': 1}, {'season': 1, 'episode': 1}, {'season': 2, 'episode': 4}]
         self.assertEqual([(v['season'], v['episode']) for v in sorted(videos, key=episode_order)], [(2, 1), (1, 1), (2, 4), (1, 5)])
+
+    def test_series_priorities_probe_newest_seasons_first(self):
+        self.s.add_categories([{'id': 'upstream.shows', 'type': 'series', 'name': 'Shows'}], 'cachedlibrary')
+        cat = self.s.db.execute("SELECT * FROM categories WHERE type='series'").fetchone()
+        self.s.add_page(cat, [{'id': 'tt123', 'name': 'Show'}], 0, 100)
+        videos = [{'id': 'tt123:%d:%d' % (s, e), 'season': s, 'episode': e, 'released': PAST}
+                  for s in (1, 2, 3) for e in (1, 2)]
+        self.s.save_meta('series', 'tt123', {'id': 'tt123', 'name': 'Show', 'videos': videos}, NOW)
+        priority = {r['id']: r['priority'] for r in self.s.db.execute('SELECT id,priority FROM checks')}
+        self.assertLess(priority['tt123:3:1'], priority['tt123:2:1'])
+        self.assertLess(priority['tt123:2:1'], priority['tt123:1:1'])
+        self.assertLess(priority['tt123:1:1'], priority['tt123:3:2'])
+
+    def test_aired_respects_timezone_offsets(self):
+        base = {'id': 'x:1:1', 'season': 1, 'episode': 1}
+        now = datetime(2000, 1, 1, tzinfo=timezone.utc).timestamp()
+        # +03:00 makes this 1999-12-31T21:30Z: already aired at midnight UTC.
+        self.assertTrue(aired(dict(base, released='2000-01-01T00:30:00+03:00'), now))
+        # -03:00 makes this 2000-01-01T02:30Z: not yet aired at midnight UTC.
+        self.assertFalse(aired(dict(base, released='1999-12-31T23:30:00-03:00'), now))
+
+    def test_genres_are_cached_briefly(self):
+        self.add(1)
+        self.s.record('movie', 'tt0000000', 'tt0000000', 'available', 1, 1000)
+        self.assertEqual(self.s.genres('movie', now=1001), [])
+        self.s.db.execute("UPDATE titles SET preview=? WHERE id='tt0000000'",
+                          (json.dumps({'id': 'tt0000000', 'name': 'A', 'genres': ['Comedy']}),))
+        self.s.db.commit()
+        self.assertEqual(self.s.genres('movie', now=1030), [])
+        self.assertEqual(self.s.genres('movie', now=1100), ['Comedy'])
 
     def test_scanner_catalog_detection(self):
         self.assertTrue(is_scanner_catalog('cachedlibrary1a2b.cached-abc', 'cachedlibrary'))
