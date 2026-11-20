@@ -128,6 +128,10 @@ Notes:
   profile under the same identity. Retiring removes confirmations of titles that
   are on no other shelf.
 - Bump `catalog_revision` after editing definitions to re-crawl shelves.
+- Shelves are displayed newest first (`shelf_order: newest`, since 0.12.0):
+  the definition picks which titles are on a shelf (e.g. the 300 most popular),
+  then they are shown by release date — series by their latest aired episode.
+  Sorting a definition by release date instead would lead with obscure titles.
 - Set AIOStreams `jellyfin.maxLibraries` high enough for the published shelf
   count.
 

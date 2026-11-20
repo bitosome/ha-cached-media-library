@@ -156,6 +156,27 @@ def aired(video, now):
         return False
 
 
+def recency(kind, preview, meta, now):
+    """Sort key for newest-first shelves: a series' latest aired regular episode
+    (so a new season of an older show counts as new), a movie's release date;
+    else the newest year in the display metadata. '' sorts last."""
+    if kind == 'series':
+        videos = [v for v in meta.get('videos') or [] if isinstance(v, dict) and aired(v, now)]
+        regular = [v for v in videos if v['season'] > 0] or videos
+        dates = [v['released'][:10] for v in regular if isinstance(v.get('released'), str)]
+        if dates:
+            return max(dates)
+    for document in (meta, preview):
+        released = document.get('released')
+        if isinstance(released, str) and re.match(r'\d{4}-\d{2}-\d{2}', released):
+            return released[:10]
+    for document in (preview, meta):
+        years = re.findall(r'(?<!\d)(\d{4})(?!\d)', str(document.get('releaseInfo') or document.get('year') or ''))
+        if years:
+            return max(years) + '-00-00'
+    return ''
+
+
 # A parked check keeps a still-valid confirmation visible until it expires, but
 # is never scheduled again (see Store._reconcile_series_checks).
 PARKED_DUE = 1e15
@@ -1093,8 +1114,11 @@ class Store:
                     return ident
         return meta.get('id') or preview['id']
 
-    def catalog(self, kind, cid, skip=0, search=None, genre=None, now=None):
+    def catalog(self, kind, cid, skip=0, search=None, genre=None, now=None, order='source'):
+        """order='newest' shows a shelf's selection newest first; the source
+        ranking still decides which titles are on it. Search keeps relevance."""
         now = time.time() if now is None else now
+        newest = order == 'newest' and search is None
         with self.lock:
             self.prune_search_results(now)
             if search is not None:
@@ -1132,9 +1156,13 @@ class Store:
                 preview.pop('videos', None)
                 preview.pop('streams', None)
                 preview['genres'] = genres
-                result.append(preview)
+                result.append((recency(kind, preview, meta, now), preview) if newest else preview)
                 if search is not None and len(result) >= max(0, skip) + 100:
                     break
+            if newest:
+                # Stable: equal dates keep the source ranking.
+                result.sort(key=lambda item: item[0], reverse=True)
+                result = [preview for _, preview in result]
             return result[max(0, skip):max(0, skip) + 100]
 
     def genres(self, kind, now=None):
@@ -1930,7 +1958,8 @@ class Handler(BaseHTTPRequestHandler):
         if ident == 'cached-search':
             metas = app.search_catalog(kind, search, skip, extra.get('genre', [None])[0]) if search else []
         else:
-            metas = app.store.catalog(kind, ident, skip, None, extra.get('genre', [None])[0])
+            metas = app.store.catalog(kind, ident, skip, None, extra.get('genre', [None])[0],
+                                      order=app.o.get('shelf_order', 'newest'))
         self.send({'metas': metas, 'cacheMaxAge': 30, 'staleRevalidate': 0, 'staleError': 0})
 
 

@@ -66,6 +66,7 @@ URLs as credentials; avoid pasting them into public logs or issue reports.
 | `max_candidates_per_category` | Upstream candidate depth per shelf, 20–5000; default 250. It is not a target number of verified results. |
 | `catalog_refresh_hours` | Refresh interval for completed source catalogues, 1–48 hours; default 6. Availability workers run continuously regardless of this interval. |
 | `catalog_revision` | Optional manual marker, empty by default. Change it after saving source selection filters to request one fresh crawl of every active shelf. Unchanged values do not restart crawling. |
+| `shelf_order` | `newest` (default since 0.12.0): each shelf's titles newest first, series by their latest aired episode; `source`: the catalogue's own ranking. Selection is unchanged either way. |
 | `max_episodes_per_series` | Checks per requested show per visit, 1–100; default 12. Since 0.11.0 a series has at most two checks, so values above 2 have no further effect. |
 | `workers` | Concurrent availability workers, 1–6; default 2. They share the rate budget below. |
 | `metadata_workers` | Concurrent metadata fetches, 1–6; default 3. Long series can have large episode lists. |

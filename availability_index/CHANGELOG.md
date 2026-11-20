@@ -9,6 +9,11 @@
 - New series filter `airedWithinDays`: only shows with an episode in that
   window. Popular-series shelves then show what is airing now, including new
   seasons of older shows, instead of TMDB's all-time long-running favourites.
+- Shelves are shown newest first (option `shelf_order`, default `newest`).
+  The catalogue's ranking still decides which titles are on a shelf; only the
+  display order changes. Series sort by their latest aired episode, so a new
+  season of an older show is near the front. `source` keeps the old order.
+  Search results keep relevance order.
 
 ## 0.11.0
 

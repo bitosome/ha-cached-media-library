@@ -61,6 +61,13 @@ configuration:
     description: >-
       How deep each catalogue is indexed. Larger values give broader coverage
       and take longer to complete. Search only covers what is indexed.
+  shelf_order:
+    name: Shelf order
+    description: >-
+      newest shows each shelf's titles newest first (series by their latest
+      aired episode); source keeps the catalogue's own ranking. The catalogue
+      ranking always decides which titles are on a shelf. Search keeps
+      relevance order.
   max_episodes_per_series:
     name: Series check batch size
     description: >-

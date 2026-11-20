@@ -36,6 +36,7 @@ options:
   tmdb_api_key: ""
   tmdb_language: en-US
   tmdb_catalogs: "[]"
+  shelf_order: newest
 schema:
   aiostreams_url: url
   active_uuid: str
@@ -60,3 +61,4 @@ schema:
   tmdb_api_key: password?
   tmdb_language: str?
   tmdb_catalogs: str?
+  shelf_order: list(newest|source)?
