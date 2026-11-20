@@ -99,8 +99,8 @@ Further selection filters (0.10.1), all validated strictly:
 | --- | --- |
 | `originalLanguages` / `excludeOriginalLanguages` | Lowercase two-letter original-language codes to keep or drop. Enforced on every returned title, so they also work for `now_playing`. |
 | `originCountries` | Uppercase two-letter origin countries (any of). |
-| `certificationCountry` + `certificationMax` | Movies only: at most this certification in that country, for example `US` and `PG`. |
-| `certificationCountry` + `certifications` | Exact ratings (any of), movies or series, for example `US` and `["TV-Y"]` for preschool series (0.12.0). Use this for series: TMDB's "at most" query matches unrated TV. |
+| `certificationCountry` + `certificationMax` | Movies only: at most this certification in that country, for example `US` and `PG`. **Also matches titles with no rating in that country** (TMDB treats a missing rating as the lowest), so never use it for children's shelves; use `certifications` instead. |
+| `certificationCountry` + `certifications` | Exact ratings (any of), movies or series, for example `US` and `["TV-Y"]` for preschool series (0.12.0). Unrated titles never match, so this is the safe choice for children's shelves (e.g. `["G"]`, `["G", "PG"]`, `["TV-Y"]`). |
 | `airedWithinDays` | Series only: an episode aired within this many days, so returning seasons of older shows count as current (0.12.0). |
 | `keywords` / `excludeKeywords` | TMDB keyword ids; `210024` is anime. |
 | `companies`, `networks` | TMDB company ids; network ids for series. |

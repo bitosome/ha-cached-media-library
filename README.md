@@ -113,7 +113,8 @@ Useful filters include `genres` / `excludeGenres`, `voteCountMin`,
 `ratingMin`/`ratingMax`, `releasedWithinDays` / `releasedBeforeDays`,
 `originalLanguages` / `excludeOriginalLanguages`, `keywords` /
 `excludeKeywords`, `companies`, `networks` (series), `tvType` (series),
-`certificationCountry` with `certificationMax` (movies) or exact `certifications`
+`certificationCountry` with exact `certifications` (use these for children's
+shelves) or `certificationMax` (movies; it also matches unrated titles)
 (movies and series, e.g. `["TV-Y"]`), `airedWithinDays` (series with a recent
 episode), `region` and
 `listType: "now_playing"` (movies). TMDB has no separate sci-fi/fantasy genres
