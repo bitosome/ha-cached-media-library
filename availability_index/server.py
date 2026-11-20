@@ -47,7 +47,7 @@ NON_POLICY_KEYS = frozenset({
     'usePosterServiceForMeta',
 })
 STRICT_FILTER = "cached(service(streams, 'torbox'))"
-APP_VERSION = '0.11.0'  # Keep in sync with config.yaml; clients read it for caching.
+APP_VERSION = '0.12.0'  # Keep in sync with config.yaml; clients read it for caching.
 
 
 def encode(value):

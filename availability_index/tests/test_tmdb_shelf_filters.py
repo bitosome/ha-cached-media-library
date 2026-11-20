@@ -101,6 +101,25 @@ class ShelfFilterTests(unittest.TestCase):
                 self.adapter(definition(**filters), Mock())
         with self.assertRaises(ValueError):
             self.adapter(definition('series', certificationCountry='US', certificationMax='TV-Y'), Mock())
+        for filters in (dict(certifications=['TV-Y']), dict(certificationCountry='US', certifications=[]),
+                        dict(certificationCountry='US', certifications=['TV Y']),
+                        dict(certificationCountry='US', certifications=['TV-Y', 'TV-Y']),
+                        dict(airedWithinDays=0), dict(airedWithinDays=True), dict(airedWithinDays=4000),
+                        dict(airedWithinDays=30, releasedOnly=False)):
+            with self.subTest(filters=filters), self.assertRaises(ValueError):
+                self.adapter(definition('series', **filters), Mock())
+        with self.assertRaises(ValueError):
+            self.adapter(definition('movie', airedWithinDays=30), Mock())
+
+    def test_series_ratings_and_recent_episode_window_are_sent_to_tmdb(self):
+        params = self.params(definition('series', certificationCountry='US', certifications=['TV-Y', 'TV-Y7'],
+                                        airedWithinDays=60))
+        self.assertEqual((params['certification_country'], params['certification']), ('US', 'TV-Y|TV-Y7'))
+        self.assertNotIn('certification.lte', params)
+        self.assertEqual((params['air_date.gte'], params['air_date.lte']), ('2026-09-16', '2026-11-15'))
+        self.assertEqual(params['first_air_date.lte'], '2026-11-15')
+        movie = self.params(definition(certificationCountry='US', certifications=['G']))
+        self.assertEqual(movie['certification'], 'G')
 
 
 if __name__ == '__main__':

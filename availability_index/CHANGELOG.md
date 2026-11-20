@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.12.0
+
+- New shelf filter `certifications`: exact ratings (any of) in
+  `certificationCountry`, for movies and series. It allows preschool series
+  shelves such as US `TV-Y`; TMDB's "at most" rating query is unreliable for
+  TV, so `certificationMax` stays movie-only.
+- New series filter `airedWithinDays`: only shows with an episode in that
+  window. Popular-series shelves then show what is airing now, including new
+  seasons of older shows, instead of TMDB's all-time long-running favourites.
+
 ## 0.11.0
 
 - Series are confirmed per title instead of per episode. Each show has at most

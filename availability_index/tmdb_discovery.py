@@ -59,6 +59,7 @@ class TMDBDiscovery:
                          'genreMatchMode', 'tvType', 'releasedWithinDays', 'region',
                          'releasedBeforeDays', 'originalLanguages', 'excludeOriginalLanguages',
                          'originCountries', 'certificationCountry', 'certificationMax',
+                         'certifications', 'airedWithinDays',
                          'keywords', 'excludeKeywords', 'companies', 'networks'})
     NOW_PLAYING_FILTERS = frozenset({'listType', 'includeAdult', 'releasedOnly', 'region',
                                      'originalLanguages', 'excludeOriginalLanguages'})
@@ -148,16 +149,29 @@ class TMDBDiscovery:
                 raise ValueError('The TMDB minimum age must be shorter than the release window')
         if 'originCountries' in filters and not _codes(filters['originCountries'], r'[A-Z]{2}'):
             raise ValueError('TMDB origin countries must be uppercase two-letter codes')
-        if ('certificationCountry' in filters) != ('certificationMax' in filters):
-            raise ValueError('A TMDB certification limit needs both a country and a maximum')
+        rated = 'certificationMax' in filters or 'certifications' in filters
+        if ('certificationCountry' in filters) != rated:
+            raise ValueError('A TMDB certification limit needs a country and a maximum or a list of ratings')
         if 'certificationCountry' in filters:
-            if value['type'] != 'movie':
-                raise ValueError('TMDB certification limits support movies only')
-            if (not isinstance(filters['certificationCountry'], str)
-                    or not re.fullmatch(r'[A-Z]{2}', filters['certificationCountry'])
-                    or not isinstance(filters['certificationMax'], str)
-                    or not re.fullmatch(r'[A-Za-z0-9+-]{1,10}', filters['certificationMax'])):
+            if not isinstance(filters['certificationCountry'], str) or not re.fullmatch(r'[A-Z]{2}', filters['certificationCountry']):
                 raise ValueError('Invalid TMDB certification limit')
+        if 'certificationMax' in filters:
+            # TMDB orders TV ratings unreliably for "at most" queries (unrated
+            # soaps and news match TV-Y); series name exact ratings instead.
+            if value['type'] != 'movie':
+                raise ValueError('TMDB certification maximums support movies only; use certifications for series')
+            if not isinstance(filters['certificationMax'], str) or not re.fullmatch(r'[A-Za-z0-9+-]{1,10}', filters['certificationMax']):
+                raise ValueError('Invalid TMDB certification limit')
+        if 'certifications' in filters and not _codes(filters['certifications'], r'[A-Za-z0-9+-]{1,10}'):
+            raise ValueError('TMDB certifications must be a list of rating codes such as TV-Y')
+        if 'airedWithinDays' in filters:
+            days = filters['airedWithinDays']
+            if value['type'] != 'series':
+                raise ValueError('TMDB recent-episode windows support series only')
+            if not _integer(days, 1) or days > 3650:
+                raise ValueError('TMDB recent-episode window must be an integer from 1 to 3650 days')
+            if not filters.get('releasedOnly', True):
+                raise ValueError('A TMDB recent-episode window requires releasedOnly')
         for field in ('keywords', 'excludeKeywords', 'companies', 'networks'):
             if field in filters and (not filters[field] or len(filters[field]) > 20
                                      or not _numbers(filters[field], 1, 100000000)):
@@ -294,7 +308,14 @@ class TMDBDiscovery:
                 params[target] = separator.join(map(str, filters[field]))
         if 'certificationCountry' in filters:
             params['certification_country'] = filters['certificationCountry']
-            params['certification.lte'] = filters['certificationMax']
+            if 'certificationMax' in filters:
+                params['certification.lte'] = filters['certificationMax']
+            if 'certifications' in filters:
+                params['certification'] = '|'.join(filters['certifications'])
+        if 'airedWithinDays' in filters:
+            # Any episode in the window, so returning seasons of older shows count.
+            params['air_date.gte'] = (date.fromisoformat(today) - timedelta(days=filters['airedWithinDays'])).isoformat()
+            params['air_date.lte'] = today
         for field, target in (('ratingMin', 'vote_average.gte'), ('ratingMax', 'vote_average.lte'),
                               ('voteCountMin', 'vote_count.gte')):
             if field in filters:
